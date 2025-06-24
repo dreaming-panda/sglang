@@ -1,6 +1,52 @@
 import triton
 import triton.language as tl
 
+
+@triton.jit
+def sa_create_flashinfer_kv_indices_paged_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr, # [bsz]
+    paged_seq_lens_ptr, # [bsz * NUM_KV_HEADS]
+    kv_indptr, # [bsz * NUM_KV_HEADS + 1]
+    kv_indices_ptr, # [num_total_kv_pages * NUM_KV_HEADS + 1]
+    req_to_token_ptr_stride: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_KV_HEAD: tl.constexpr
+):  
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(0)
+    req_id = pid // NUM_KV_HEAD
+    head_id = pid % NUM_KV_HEAD
+
+    req_pool_index = tl.load(req_pool_indices_ptr + req_id)
+    kv_indices_offset = tl.load(kv_indptr + pid)
+    
+    paged_kv_len = tl.load(paged_seq_lens_ptr + pid)
+    
+    num_loop = tl.cdiv(paged_kv_len, BLOCK_SIZE)
+    
+    for i in range(num_loop):
+        # index into req_to_token_ptr needs to be int64
+        offset = (tl.arange(0, BLOCK_SIZE).to(tl.int64) \
+        + i * BLOCK_SIZE)
+        mask = offset < paged_kv_len
+        
+        
+        token_origin = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + offset * PAGE_SIZE,
+            mask=mask,
+        )
+        
+        token_trans = (token_origin // PAGE_SIZE) * (PAGE_SIZE * NUM_KV_HEAD) + \
+        head_id * PAGE_SIZE + token_origin %  PAGE_SIZE
+        
+        page_id = token_trans // PAGE_SIZE
+        
+        tl.store(kv_indices_ptr + kv_indices_offset + offset, page_id, mask=mask)
+        
+
 @triton.jit
 def sa_create_flashinfer_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]

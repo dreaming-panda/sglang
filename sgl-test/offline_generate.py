@@ -39,6 +39,5 @@ def main():
     for prompt, output in zip(prompts, outputs):
         print("===============================")
         print(f"Prompt: {prompt}\nGenerated text: {output['text']}")
-        print(output)
 if __name__ == "__main__":
     main()

@@ -24,12 +24,7 @@ if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.attention.sa_triton_utils import (
-sa_create_flashinfer_kv_indices_triton, 
-q_transpose_triton, 
-o_transpose_triton,
-sa_create_flashinfer_kv_indices_paged_triton
-)
+from sglang.srt.layers.attention.sa_triton_utils import sa_create_flashinfer_kv_indices_triton, q_transpose_triton, o_transpose_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -240,6 +235,11 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                 )
 
+                # q [bsz * num_kv_heads, num_groups, head_dim]
+                # k,v [num_pages, 1, head_dim]
+                # o [bsz * num_kv_heads, num_groups, head_dim]
+                # s [bsz * num_kv_heads, num_groups]
+        
                 q_transpose = torch.empty(size= \
                 (q.shape[0] * self.num_kv_heads, self.num_attention_groups, layer.head_dim),
                 dtype=q.dtype, device=q.device)
@@ -316,9 +316,7 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v
                 )
 
-        k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k = k.view(-1, self.page_size, 1, self.head_dim)
-        v = v.view(-1, self.page_size, 1, self.head_dim)
+        (k, v) = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, self.num_attention_groups, layer.head_dim),
@@ -329,6 +327,11 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
             v_scale=layer.v_scale,
         )
         
+        torch.save(q, "ref_q.pt")
+        torch.save(k, "ref_k.pt")
+        torch.save(v, "ref_v.pt")
+        print(o)
+        exit(0)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
@@ -387,10 +390,10 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
             decode_wrappers[0],
             req_pool_indices,
             seq_lens,
+            seq_lens_sum,
             self.kv_indptr[0],
-            self.kv_last_page_len,
             None,
-            spec_info
+            spec_info,
         )
 
 
@@ -398,45 +401,45 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
         self,
         wrapper: BatchDecodeWithPagedKVCacheWrapper,
         req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
-        kv_last_page_len: torch.Tensor,
         kv_start_idx: torch.Tensor,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         
         bs = len(req_pool_indices)
-        seq_lens_translated = torch.repeat_interleave(seq_lens,repeats=self.num_kv_heads, dim=0)
-        paged_seq_lens_translated = (seq_lens_translated + self.page_size - 1) // self.page_size
+        paged_kernel_lens_trans = torch.repeat_interleave(paged_kernel_lens, 
+        repeats=self.num_kv_heads, dim=0)
         
-        paged_seq_lens_translated_sum = paged_seq_lens_translated.sum().item()
-        kv_indptr[1 : self.num_kv_heads * bs + 1] = torch.cumsum(paged_seq_lens_translated, dim=0)
+        kv_indptr[1 : self.num_kv_heads * bs + 1] = torch.cumsum(paged_kernel_lens_trans, dim=0)
         kv_indptr = kv_indptr[: self.num_kv_heads * bs + 1]
-        
-        kv_indices = torch.empty(
-                    paged_seq_lens_translated_sum, dtype=torch.int32, device="cuda"
+
+        kv_indices = torch.zeros(
+                    self.num_kv_heads * paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
             )
-        sa_create_flashinfer_kv_indices_paged_triton[(bs * self.num_kv_heads,)](
+        sa_create_flashinfer_kv_indices_triton[(bs * self.num_kv_heads,)](
                 self.req_to_token,
                 req_pool_indices,
-                paged_seq_lens_translated,
+                paged_kernel_lens_trans,
                 kv_indptr,
+                kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
                 self.page_size,
                 self.num_kv_heads
             )
-        
-        kv_last_page_len = (seq_lens_translated - 1) % self.page_size + 1
-        
+        print(kv_indptr)
+        print(kv_indices)
+        print(self.kv_last_page_len[:self.num_kv_heads * bs])
         wrapper.begin_forward(
             kv_indptr,
             kv_indices,
-            kv_last_page_len.to(torch.int32),
+            self.kv_last_page_len[:self.num_kv_heads * bs],
             self.num_attention_groups,
             1,
             self.head_dim,
-            self.page_size,
+            1,
             data_type=self.data_type,
             q_data_type=self.q_data_type,
             non_blocking=True,
@@ -599,4 +602,3 @@ class FlashInferBlockSparseIndicesUpdaterPrefill:
             custom_mask=custom_mask,
             non_blocking=True,
         )
-

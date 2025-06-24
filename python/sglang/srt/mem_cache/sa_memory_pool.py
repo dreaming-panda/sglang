@@ -95,14 +95,14 @@ class BlockSparseTokenToKVPool(KVCache):
             # [size * head_num, 1, head_dim] for each layer
             # [i * head_num, (i+1) * head_num) is the flatten KV cache for one page
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # self.landmark_buffer = [
-            #     torch.zeros(
-            #         (self.num_landmarks * self.head_num, 1, self.head_dim),
-            #         dtype=self.store_dtype,
-            #         device=self.device,
-            #     )
-            #     for _ in range(self.layer_num)
-            # ]
+            self.landmark_buffer = [
+                torch.zeros(
+                    (self.num_landmarks * self.head_num, 1, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
             
             # [size * head_num, 1, head_dim] for each layer
             # [i * head_num, (i+1) * head_num) is the flatten KV cache for one token
@@ -136,7 +136,7 @@ class BlockSparseTokenToKVPool(KVCache):
             # i.e. landmark = (kv_{original} // PAGE_SIZE) * NUM_KV_HEAD + head_id
             # if (kv_{original} + 1) % PAGE_SIZE == 0, then a new block is finished, we can calculate the correnponding value
     def _clear_buffers(self):
-        #del self.landmark_buffer
+        del self.landmark_buffer
         del self.k_buffer
         del self.v_buffer
 
@@ -161,8 +161,9 @@ class BlockSparseTokenToKVPool(KVCache):
         
         return self.v_buffer[layer_id - self.start_layer]
     
-    # def get_landmark_buffer(self, layer_id: int):
-    #     return self.landmark_buffer[layer_id - self.start_layer]    
+    def get_landmark_buffer(self, layer_id: int):
+        
+        return self.landmark_buffer[layer_id - self.start_layer]    
 
     def get_kv_buffer(self, layer_id: int):
         
@@ -203,7 +204,7 @@ class BlockSparseTokenToKVPool(KVCache):
     def get_memory_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
-        #assert hasattr(self, "landmark_buffer")
+        assert hasattr(self, "landmark_buffer")
         k_size_bytes = 0
         for k_cache in self.k_buffer:
             k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
@@ -211,6 +212,6 @@ class BlockSparseTokenToKVPool(KVCache):
         for v_cache in self.v_buffer:
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
         lmk_size_bytes = 0
-        # for lmk_cache in self.landmark_buffer:
-        #     lmk_size_bytes += np.prod(lmk_cache.shape) * lmk_cache.dtype.itemsize
+        for lmk_cache in self.landmark_buffer:
+            lmk_size_bytes += np.prod(lmk_cache.shape) * lmk_cache.dtype.itemsize
         return k_size_bytes, v_size_bytes, lmk_size_bytes

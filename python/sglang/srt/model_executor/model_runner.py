@@ -806,6 +806,15 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+        elif self.server_args.enable_block_sparse_attention:
+            cell_size = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * self.model_config.head_dim
+                * num_layers
+                * 2
+                * torch._utils._element_size(self.kv_cache_dtype)
+                * (1.0 + 0.5 / self.page_size)
+            )
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
