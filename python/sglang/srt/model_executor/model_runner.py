@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.sa_memory_pool import BlockSparseTokenToKVPool
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -941,6 +942,19 @@ class ModelRunner:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
+        elif self.server_args.enable_block_sparse_attention:
+             self.token_to_kv_pool = BlockSparseTokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
@@ -991,7 +1005,13 @@ class ModelRunner:
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
-            if not self.use_mla_backend:
+            if self.server_args.enable_block_sparse_attention:
+                from sglang.srt.layers.attention.flashinfer_blocksparse_backend import (
+                    FlashInferBlockSparseAttnBackend,
+                )
+                self.attn_backend = FlashInferBlockSparseAttnBackend(self)
+                
+            elif not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
                 )

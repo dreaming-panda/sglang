@@ -220,6 +220,9 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     pdlb_url: Optional[str] = None
 
+    
+    # Block Sparse Attention
+    enable_block_sparse_attention: bool = False
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -1414,6 +1417,13 @@ class ServerArgs:
             choices=["sdpa", "fa3", "triton_attn"],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
+        )
+        
+        parser.add_argument(
+            "--enable-block-sparse-attention",
+            type=bool,
+            default=ServerArgs.enable_block_sparse_attention,
+            help="Whether to use block sparse attention.",
         )
 
     @classmethod
