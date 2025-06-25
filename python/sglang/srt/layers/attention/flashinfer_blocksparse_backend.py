@@ -59,6 +59,8 @@ class DecodeMetadata:
     sparse_kv_inptr: torch.Tensor
     kv_last_page_len: torch.Tensor
     kv_block_score: torch.Tensor
+    workload_ptr: torch.Tensor
+    req_table: torch.Tensor
 
 @dataclass
 class PrefillMetadata:
@@ -91,7 +93,7 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_active_kv_blocks = model_runner.server_args.num_active_kv_blocks
         self.layer_skip = model_runner.server_args.sparse_attention_layer_skip
-       
+        self.lmk_page_size = 2
         assert not self.skip_prefill
         assert not self.is_multimodal
         assert not model_runner.model_config.is_encoder_decoder
@@ -340,9 +342,11 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
             all_kv_indptr = self.forward_metadata.kv_indptr
             sparse_indptr = self.forward_metadata.sparse_kv_inptr
             score_buffer = self.forward_metadata.kv_block_score
+            workload_ptr = self.forward_metadata.workload_ptr
+            req_table = self.forward_metadata.req_table
             lmk = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
             q_compress = q.view(-1, self.num_attention_groups, layer.head_dim).contiguous().mean(dim=-2)
-            block_sparse_attention.build_local_indices(
+            block_sparse_attention.build_block_topk_indices(
                 q_compress,
                 lmk,
                 score_buffer,
@@ -350,6 +354,9 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
                 all_kv_indices,
                 sparse_indptr,
                 decode_wrapper._paged_kv_indices_buf,
+                workload_ptr,
+                req_table,
+                self.lmk_page_size,
                 self.num_active_kv_blocks
             )
         # Call the wrapped function
@@ -388,6 +395,7 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
         self.page_size = self.attn_backend.page_size
+        self.lmk_page_size = self.attn_backend.lmk_page_size
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -430,9 +438,21 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
         seq_lens_translated = torch.repeat_interleave(seq_lens,repeats=self.num_kv_heads, dim=0)
         paged_seq_lens_translated = (seq_lens_translated + self.page_size - 1) // self.page_size
         
+        workload_ptr = torch.empty(size=(self.num_kv_heads * bs + 1,), device=
+            self.req_to_token.device, dtype=torch.int32)
+        
+        paged_workload_per_req = (paged_seq_lens_translated + self.lmk_page_size - 1) // self.lmk_page_size
+        workload_ptr[1:].copy_(paged_workload_per_req.cumsum(dim=0))
+        workload_ptr[0] = 0
+        
+        req_table = torch.empty(size=(workload_ptr[-1],), device=self.req_to_token.device, dtype=torch.int32)
+        for i in range(self.num_kv_heads * bs):
+            req_table[workload_ptr[i]: workload_ptr[i+1]] = i
+        
+        
         paged_max_seq_lens = paged_seq_lens_translated.max()
         kv_block_score = torch.full(
-            size=(self.num_kv_heads * bs, paged_max_seq_lens),
+            size=(self.num_kv_heads * bs, max(paged_max_seq_lens, self.num_active_kv_blocks)),
             fill_value=torch.finfo(self.data_type).min,
             device=self.req_to_token.device
         )
@@ -498,7 +518,9 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
             kv_indices, 
             sparse_kv_indptr, 
             kv_last_page_len,
-            kv_block_score)
+            kv_block_score,
+            workload_ptr,
+            req_table)
         
 class FlashInferBlockSparseIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferBlockSparseAttnBackend):
