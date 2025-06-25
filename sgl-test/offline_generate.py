@@ -15,7 +15,7 @@ def main():
         page_size=4, 
         disable_overlap_schedule=True,
         enable_block_sparse_attention=True,
-        num_active_kv_blocks=5,
+        num_active_kv_blocks=3,
         sparse_attention_layer_skip=[0,1])
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     texts = [
@@ -33,7 +33,7 @@ def main():
     ) for text in texts
     ]
     
-    prompts = prompts * 10
+    #prompts = prompts * 10
 
     sampling_params = {"temperature": 1e-7, "top_p": 0.95, "max_new_tokens": 128}
 

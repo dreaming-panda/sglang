@@ -341,8 +341,9 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
             sparse_indptr = self.forward_metadata.sparse_kv_inptr
             score_buffer = self.forward_metadata.kv_block_score
             lmk = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
+            q_compress = q.view(-1, self.num_attention_groups, layer.head_dim).contiguous().mean(dim=-2)
             block_sparse_attention.build_local_indices(
-                q.contiguous().view(-1, self.num_attention_groups, layer.head_dim),
+                q_compress,
                 lmk,
                 score_buffer,
                 all_kv_indptr,
