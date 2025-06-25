@@ -192,14 +192,14 @@ class BlockSparseTokenToKVPool(KVCache):
         )
         
         #Directly update the landmark tensor when applicaple (i.e, one page is fullfilled.)
-        # update_landmark_launcher(
-        #     self.k_buffer[layer_id - self.start_layer],
-        #     self.landmark_buffer[layer_id - self.start_layer],
-        #     loc,
-        #     self.page_size,
-        #     self.head_num,
-        #     self.head_dim
-        # )
+        update_landmark_launcher(
+            self.k_buffer[layer_id - self.start_layer],
+            self.landmark_buffer[layer_id - self.start_layer],
+            loc,
+            self.page_size,
+            self.head_num,
+            self.head_dim
+        )
 
     def get_memory_bytes(self):
         assert hasattr(self, "k_buffer")

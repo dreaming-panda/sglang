@@ -223,6 +223,8 @@ class ServerArgs:
     
     # Block Sparse Attention
     enable_block_sparse_attention: bool = False
+    num_active_kv_blocks: int = 32
+    sparse_attention_layer_skip: Optional[List[int]] = None
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -1424,6 +1426,20 @@ class ServerArgs:
             type=bool,
             default=ServerArgs.enable_block_sparse_attention,
             help="Whether to use block sparse attention.",
+        )
+        
+        parser.add_argument(
+            "--num-active-kv-blocks",
+            type=int,
+            default=ServerArgs.num_active_kv_blocks,
+            help="Set number of active KV blocks.",
+        )
+        
+        parser.add_argument(
+            "--sparse-attention-layer-skip",
+            type=list[int],
+            default=ServerArgs.sparse_attention_layer_skip,
+            help="Set the layers to skip in sparse attention.",
         )
 
     @classmethod

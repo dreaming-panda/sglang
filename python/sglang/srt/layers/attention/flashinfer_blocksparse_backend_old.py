@@ -327,11 +327,6 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
             v_scale=layer.v_scale,
         )
         
-        torch.save(q, "ref_q.pt")
-        torch.save(k, "ref_k.pt")
-        torch.save(v, "ref_v.pt")
-        print(o)
-        exit(0)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):

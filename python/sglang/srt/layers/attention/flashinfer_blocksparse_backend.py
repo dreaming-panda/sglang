@@ -48,16 +48,17 @@ if is_flashinfer_available():
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
-
-class WrapperDispatch(Enum):
-    SLIDING_WINDOW = auto()
-    CROSS_ATTENTION = auto()
+import block_sparse_attention
 
 
 @dataclass
 class DecodeMetadata:
-    decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
-
+    #decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    sparse_kv_inptr: torch.Tensor
+    kv_last_page_len: torch.Tensor
+    kv_block_score: torch.Tensor
 
 @dataclass
 class PrefillMetadata:
@@ -88,6 +89,9 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.num_active_kv_blocks = model_runner.server_args.num_active_kv_blocks
+        self.layer_skip = model_runner.server_args.sparse_attention_layer_skip
+       
         assert not self.skip_prefill
         assert not self.is_multimodal
         assert not model_runner.model_config.is_encoder_decoder
@@ -124,6 +128,9 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
         self.kv_indptr = [
                 torch.zeros(
                     (max_bs * self.num_kv_heads + 1,), dtype=torch.int32, device=model_runner.device
+                ),
+                torch.zeros(
+                    (max_bs * self.num_kv_heads + 1,), dtype=torch.int32, device=model_runner.device
                 )
             ]
         
@@ -157,7 +164,13 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         use_tensor_cores=self.decode_use_tensor_cores,
-                )
+                ),
+            
+             BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                ),
         ]
         # Create indices updater
         self.indices_updater_prefill = FlashInferBlockSparseIndicesUpdaterPrefill(
@@ -169,7 +182,7 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
-            self.indices_updater_decode.update(
+            self.forward_metadata = self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
@@ -177,7 +190,7 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            #self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         else:
             prefix_lens = forward_batch.extend_prefix_lens
             use_ragged = True
@@ -206,7 +219,7 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-    ):
+    ):  
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -300,9 +313,7 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):  
-        decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
+        
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -319,6 +330,27 @@ class FlashInferBlockSparseAttnBackend(AttentionBackend):
         k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k = k.view(-1, self.page_size, 1, self.head_dim)
         v = v.view(-1, self.page_size, 1, self.head_dim)
+
+        
+        is_sparse = (layer.layer_id not in self.layer_skip)
+        decode_wrapper = self.decode_wrappers[1] if is_sparse else self.decode_wrappers[0]
+        
+        if is_sparse:
+            all_kv_indices = self.forward_metadata.kv_indices
+            all_kv_indptr = self.forward_metadata.kv_indptr
+            sparse_indptr = self.forward_metadata.sparse_kv_inptr
+            score_buffer = self.forward_metadata.kv_block_score
+            lmk = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
+            block_sparse_attention.build_local_indices(
+                q.contiguous().view(-1, self.num_attention_groups, layer.head_dim),
+                lmk,
+                score_buffer,
+                all_kv_indptr,
+                all_kv_indices,
+                sparse_indptr,
+                decode_wrapper._paged_kv_indices_buf,
+                self.num_active_kv_blocks
+            )
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, self.num_attention_groups, layer.head_dim),
@@ -359,8 +391,8 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.update = self.update_single_wrapper
-
+        self.num_active_kv_blocks = attn_backend.num_active_kv_blocks
+        
     def update(
         self,
         req_pool_indices: torch.Tensor,
@@ -370,24 +402,12 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        # Keep the signature for type checking. It will be assigned during runtime.
-        raise NotImplementedError()
 
-    def update_single_wrapper(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
-        encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
-        self.call_begin_forward(
-            decode_wrappers[0],
+        return self.call_begin_forward(
+            decode_wrappers,
             req_pool_indices,
             seq_lens,
-            self.kv_indptr[0],
+            self.kv_indptr,
             self.kv_last_page_len,
             None,
             spec_info
@@ -396,10 +416,10 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
 
     def call_begin_forward(
         self,
-        wrapper: BatchDecodeWithPagedKVCacheWrapper,
+        wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        kv_indptr: torch.Tensor,
+        kv_indptr: List[torch.Tensor],
         kv_last_page_len: torch.Tensor,
         kv_start_idx: torch.Tensor,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -409,30 +429,37 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
         seq_lens_translated = torch.repeat_interleave(seq_lens,repeats=self.num_kv_heads, dim=0)
         paged_seq_lens_translated = (seq_lens_translated + self.page_size - 1) // self.page_size
         
+        paged_max_seq_lens = paged_seq_lens_translated.max()
+        kv_block_score = torch.full(
+            size=(self.num_kv_heads * bs, paged_max_seq_lens),
+            fill_value=torch.finfo(self.data_type).min,
+            device=self.req_to_token.device
+        )
+        # Dense wrapper
         paged_seq_lens_translated_sum = paged_seq_lens_translated.sum().item()
-        kv_indptr[1 : self.num_kv_heads * bs + 1] = torch.cumsum(paged_seq_lens_translated, dim=0)
-        kv_indptr = kv_indptr[: self.num_kv_heads * bs + 1]
+        kv_indptr[0][1 : self.num_kv_heads * bs + 1] = torch.cumsum(paged_seq_lens_translated, dim=0)
+        dense_kv_indptr = kv_indptr[0][: self.num_kv_heads * bs + 1]
         
         kv_indices = torch.empty(
-                    paged_seq_lens_translated_sum, dtype=torch.int32, device="cuda"
+                    paged_seq_lens_translated_sum, dtype=torch.int32, device=self.req_to_token.device
             )
         sa_create_flashinfer_kv_indices_paged_triton[(bs * self.num_kv_heads,)](
                 self.req_to_token,
                 req_pool_indices,
                 paged_seq_lens_translated,
-                kv_indptr,
+                dense_kv_indptr,
                 kv_indices,
                 self.req_to_token.shape[1],
                 self.page_size,
                 self.num_kv_heads
             )
         
-        kv_last_page_len = (seq_lens_translated - 1) % self.page_size + 1
+        kv_last_page_len = ((seq_lens_translated - 1) % self.page_size + 1).to(torch.int32)
         
-        wrapper.begin_forward(
-            kv_indptr,
+        wrappers[0].begin_forward(
+            dense_kv_indptr,
             kv_indices,
-            kv_last_page_len.to(torch.int32),
+            kv_last_page_len,
             self.num_attention_groups,
             1,
             self.head_dim,
@@ -442,7 +469,36 @@ class FlashInferBlockSparseIndicesUpdaterDecode:
             non_blocking=True,
         )
 
-
+        #Sparse wrapper
+        sparse_paged_seq_lens_translated = torch.clamp(paged_seq_lens_translated, max=self.num_active_kv_blocks)
+        sparse_paged_seq_lens_translated_sum = sparse_paged_seq_lens_translated.sum().item()
+        
+        kv_indptr[1][1 : self.num_kv_heads * bs + 1] = torch.cumsum(sparse_paged_seq_lens_translated, dim=0)
+        sparse_kv_indptr = kv_indptr[1][: self.num_kv_heads * bs + 1]
+        sparse_kv_indices = torch.empty(
+                    sparse_paged_seq_lens_translated_sum, dtype=torch.int32, device=self.req_to_token.device
+            )
+        
+        wrappers[1].begin_forward(
+            sparse_kv_indptr,
+            sparse_kv_indices,
+            kv_last_page_len,
+            self.num_attention_groups,
+            1,
+            self.head_dim,
+            self.page_size,
+            data_type=self.data_type,
+            q_data_type=self.q_data_type,
+            non_blocking=True,
+        )
+        
+        return DecodeMetadata(
+            dense_kv_indptr, 
+            kv_indices, 
+            sparse_kv_indptr, 
+            kv_last_page_len,
+            kv_block_score)
+        
 class FlashInferBlockSparseIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferBlockSparseAttnBackend):
         # Parse Constants

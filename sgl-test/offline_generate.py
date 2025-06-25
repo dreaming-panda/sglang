@@ -14,7 +14,9 @@ def main():
         disable_cuda_graph=True, 
         page_size=4, 
         disable_overlap_schedule=True,
-        enable_block_sparse_attention=True)
+        enable_block_sparse_attention=True,
+        num_active_kv_blocks=5,
+        sparse_attention_layer_skip=[0,1])
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     texts = [
         [{"role":"user","content":"Hello, what is your name?"}],
