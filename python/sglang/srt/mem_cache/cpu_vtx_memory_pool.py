@@ -9,6 +9,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.utils import debug_timing, is_cuda
 from sglang.srt.mem_cache.cpu_gpu_copy_kernels import (
     copy_sparse_kv_cpu_to_gpu,
+    copy_sparse_kv_cpu_to_gpu_tiled,
     store_kv_gpu_to_cpu,
     update_landmark_from_cpu,
     naive_copy,
@@ -253,6 +254,9 @@ class CPUVTXTokenToKVPool(KVCache):
 
         # Use Triton kernel for efficient CPU->GPU sparse copy
         # sparse_indices already contains per-head page indices from Vortex API
+        import time
+
+        # start_time_1 = time.time()
         copy_sparse_kv_cpu_to_gpu(
             cpu_k_buffer=self.k_buffer[layer_id - self.start_layer],
             cpu_v_buffer=self.v_buffer[layer_id - self.start_layer],
@@ -261,6 +265,27 @@ class CPUVTXTokenToKVPool(KVCache):
             sparse_indices=sparse_indices,
             page_size=self.page_size,
         )
+        # end_time_1 = time.time()
+        
+        # start_time_2 = time.time()
+        # copy_sparse_kv_cpu_to_gpu_tiled(
+        #     cpu_k_buffer=self.k_buffer[layer_id - self.start_layer],
+        #     cpu_v_buffer=self.v_buffer[layer_id - self.start_layer],
+        #     gpu_k_staging=k_staging,
+        #     gpu_v_staging=v_staging,
+        #     sparse_indices=sparse_indices,
+        #     page_size=self.page_size,
+        # )
+        # end_time_2 = time.time()
+        
+        # first_time = end_time_1 - start_time_1
+        # second_time = end_time_2 - start_time_2
+        # if second_time < first_time:
+        #     k_staging, v_staging = self.k_staging_buffer[layer_idx], self.v_staging_buffer[layer_idx]
+        #     print("Using tiled version")
+        # else:
+        #     print("Using original version")
+        
         
         # naive_copy(
         #     cpu_k=self.k_buffer[layer_id - self.start_layer],

@@ -53,18 +53,6 @@ def copy_sparse_kv_cpu_to_gpu(
     sparse_indices: torch.Tensor,
     page_size: int,
 ):
-    """
-    Python wrapper for CPU->GPU sparse copy kernel.
-
-    Args:
-        cpu_k_buffer: CPU K cache [total_tokens * head_num, 1, head_dim]
-        cpu_v_buffer: CPU V cache [total_tokens * head_num, 1, head_dim]
-        gpu_k_staging: GPU staging buffer [max_tokens * head_num, 1, head_dim]
-        gpu_v_staging: GPU staging buffer [max_tokens * head_num, 1, head_dim]
-        sparse_indices: Per-head page indices to copy [num_sparse_pages]
-        page_size: Number of tokens per page
-        head_num: Number of KV heads (unused, kept for compatibility)
-    """
     assert cpu_k_buffer.is_pinned(), "CPU buffer must be pinned memory"
     assert cpu_v_buffer.is_pinned(), "CPU buffer must be pinned memory"
     assert gpu_k_staging.is_cuda, "GPU staging must be on CUDA"
@@ -89,6 +77,96 @@ def copy_sparse_kv_cpu_to_gpu(
         PAGE_SIZE=page_size,
         HEAD_DIM=head_dim,
         NUM_SPARSE_PAGES=num_sparse_pages,
+    )
+    
+@triton.jit
+def cpu_to_gpu_sparse_copy_kernel_tiled(
+    cpu_k_ptr, cpu_v_ptr,
+    gpu_k_ptr, gpu_v_ptr,
+    sparse_indices_ptr,            # [NUM_SPARSE_PAGES]
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_SPARSE_PAGES: tl.constexpr,
+    BLOCK_T: tl.constexpr,         # tokens per program (tile height)
+    BLOCK_D: tl.constexpr          # head-dim elements per iteration (tile width)
+):
+    # 2D launch: (page_id, token_tile_id)
+    pid_page = tl.program_id(0)
+    pid_tok_tile = tl.program_id(1)
+    if pid_page >= NUM_SPARSE_PAGES:
+        return
+
+    # Which page we pull from on CPU (per-head sparse page index):
+    src_per_head_page = tl.load(sparse_indices_ptr + pid_page)
+
+    # Token offsets within the page for this tile
+    tok_offsets = pid_tok_tile * BLOCK_T + tl.arange(0, BLOCK_T)
+    tok_mask = tok_offsets < PAGE_SIZE
+
+    # Base linear indices for src/dst (WITHOUT head-dim yet)
+    src_lin_base = src_per_head_page * PAGE_SIZE + tok_offsets
+    dst_lin_base = pid_page         * PAGE_SIZE + tok_offsets
+
+    # Sweep across head_dim in BLOCK_D stripes
+    for d0 in range(0, HEAD_DIM, BLOCK_D):
+        d_offsets = d0 + tl.arange(0, BLOCK_D)
+        d_mask = d_offsets < HEAD_DIM
+
+        # Build 2D (tokens x dims) pointer grids
+        # indices shape: [BLOCK_T, BLOCK_D]
+        src_idx = (src_lin_base[:, None] * HEAD_DIM) + d_offsets[None, :]
+        dst_idx = (dst_lin_base[:, None] * HEAD_DIM) + d_offsets[None, :]
+
+        mask = tok_mask[:, None] & d_mask[None, :]
+
+        # Load a TILE from CPU pinned memory and store to GPU
+        k_tile = tl.load(cpu_k_ptr + src_idx, mask=mask, other=0)
+        v_tile = tl.load(cpu_v_ptr + src_idx, mask=mask, other=0)
+        tl.store(gpu_k_ptr + dst_idx, k_tile, mask=mask)
+        tl.store(gpu_v_ptr + dst_idx, v_tile, mask=mask)
+
+
+def copy_sparse_kv_cpu_to_gpu_tiled(
+    cpu_k_buffer,  # [total_entries, 1, head_dim], pinned
+    cpu_v_buffer,  # [total_entries, 1, head_dim], pinned
+    gpu_k_staging, # [num_sparse_pages*page_size, 1, head_dim], cuda
+    gpu_v_staging, # [num_sparse_pages*page_size, 1, head_dim], cuda
+    sparse_indices,# [num_sparse_pages], int32/int64
+    page_size: int,
+    block_t: int = 64,     # tune: 32/64/128 are common choices
+    block_d: int = 128,    # tune: multiples of 32/64/128 work well
+    num_warps: int = 4,    # tune: 4/8 (A100/H100 often like 4–8)
+    num_stages: int = 2    # tune: 2–4 to overlap mem
+):
+    assert cpu_k_buffer.is_pinned() and cpu_v_buffer.is_pinned()
+    assert gpu_k_staging.is_cuda and gpu_v_staging.is_cuda
+    assert cpu_k_buffer.dim() == 3 and cpu_k_buffer.shape[1] == 1
+    assert gpu_k_staging.dim() == 3 and gpu_k_staging.shape[1] == 1
+
+    num_sparse_pages = int(sparse_indices.shape[0])
+    head_dim = int(cpu_k_buffer.shape[2])
+
+    # Flatten the trivial middle dim for pointer arithmetic
+    cpu_k_flat = cpu_k_buffer.view(-1, head_dim)
+    cpu_v_flat = cpu_v_buffer.view(-1, head_dim)
+    gpu_k_flat = gpu_k_staging.view(-1, head_dim)
+    gpu_v_flat = gpu_v_staging.view(-1, head_dim)
+
+    # Grid: pages × token-tiles-per-page
+    tiles_per_page = (page_size + block_t - 1) // block_t
+    grid = (num_sparse_pages, tiles_per_page)
+
+    cpu_to_gpu_sparse_copy_kernel_tiled[grid](
+        cpu_k_flat, cpu_v_flat,
+        gpu_k_flat, gpu_v_flat,
+        sparse_indices,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
+        NUM_SPARSE_PAGES=num_sparse_pages,
+        BLOCK_T=block_t,
+        BLOCK_D=block_d,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     
 @triton.jit
