@@ -90,6 +90,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 
 from sglang.srt.mem_cache.vtx_memory_pool import VTXTokenToKVPool
+from sglang.srt.mem_cache.cpu_vtx_memory_pool import CPUVTXTokenToKVPool
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
@@ -1191,6 +1192,23 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
+            elif self.server_args.attention_backend == "cpu_vtx_flashinfer":
+                # CPU-based KV cache for Vortex sparse attention
+                self.token_to_kv_pool = CPUVTXTokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    layer_skips=self.server_args.vortex_layers_skip
+                )
             elif self.server_args.enable_vortex_sparsity:
                 self.token_to_kv_pool = VTXTokenToKVPool(
                     self.max_total_num_tokens,
@@ -1282,12 +1300,18 @@ class ModelRunner:
 
     # TODO unify with 6338
     def _get_attention_backend(self):
-        if self.server_args.attention_backend == "flashinfer":
+        if self.server_args.attention_backend == "cpu_vtx_flashinfer":
+            # CPU-based KV cache with Vortex sparse attention
+            from sglang.srt.layers.attention.cpu_vtx_flashinfer_backend import (
+                CPUVTXFlashInferAttnBackend,
+            )
+            return CPUVTXFlashInferAttnBackend(self)
+        elif self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
                 from sglang.srt.layers.attention.vtx_flashinfer_backend import (
                     VTXFlashInferAttnBackend,
                 )
-                
+
                 return VTXFlashInferAttnBackend(self)
             elif not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
