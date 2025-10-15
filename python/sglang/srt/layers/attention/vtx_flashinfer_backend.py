@@ -314,7 +314,6 @@ class VTXFlashInferAttnBackend(AttentionBackend):
                 non_blocking=True,
             )
             
-
             self.forward_metadata = PrefillMetadata(extend_no_prefix)
 
     def init_cuda_graph_state(

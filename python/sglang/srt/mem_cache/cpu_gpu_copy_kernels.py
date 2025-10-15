@@ -13,23 +13,29 @@ import triton.language as tl
 def cpu_to_gpu_sparse_copy_kernel(
     cpu_k_ptr, cpu_v_ptr,
     gpu_k_ptr, gpu_v_ptr,
-    sparse_indices_ptr,     # page_id (per head)
-    head_ids_ptr,           # head_id for each page
-    NUM_KV_HEADS: tl.constexpr,
+    sparse_indices_ptr,     # per-head page indices from Vortex API
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_SPARSE_PAGES: tl.constexpr,
 ):
+    """
+    Copy sparse KV pages from CPU to GPU.
+
+    sparse_indices contains per-head page indices (same indices used by FlashInfer).
+    Both CPU and GPU buffers have shape [total_entries, 1, head_dim] where
+    total_entries = num_per_head_pages * page_size.
+    """
     token_idx = tl.program_id(0)
-    page_idx = token_idx // PAGE_SIZE
-    token_offset = token_idx % PAGE_SIZE
+    page_idx = token_idx // PAGE_SIZE # which sparse page it belongs to
+    token_offset = token_idx % PAGE_SIZE # offset within the page
     if page_idx >= NUM_SPARSE_PAGES:
         return
 
-    page_id = tl.load(sparse_indices_ptr + page_idx)
-    head_id = tl.load(head_ids_ptr + page_idx)
+    # sparse_indices[page_idx] is already a per-head page index
+    src_per_head_page = tl.load(sparse_indices_ptr + page_idx)
 
-    src_linear_idx = ((page_id * NUM_KV_HEADS) + head_id) * PAGE_SIZE + token_offset
+    # Linear index in the buffer: per_head_page * page_size + token_offset
+    src_linear_idx = src_per_head_page * PAGE_SIZE + token_offset
     dst_linear_idx = page_idx * PAGE_SIZE + token_offset
 
     dim = tl.arange(0, HEAD_DIM)
@@ -45,9 +51,7 @@ def copy_sparse_kv_cpu_to_gpu(
     gpu_k_staging: torch.Tensor,
     gpu_v_staging: torch.Tensor,
     sparse_indices: torch.Tensor,
-    head_ids: torch.Tensor,
     page_size: int,
-    head_num: int,
 ):
     """
     Python wrapper for CPU->GPU sparse copy kernel.
@@ -82,48 +86,10 @@ def copy_sparse_kv_cpu_to_gpu(
         gpu_k_staging,
         gpu_v_staging,
         sparse_indices,
-        head_ids,
-        NUM_KV_HEADS=head_num,
         PAGE_SIZE=page_size,
         HEAD_DIM=head_dim,
         NUM_SPARSE_PAGES=num_sparse_pages,
     )
-    
-def build_head_ids_per_page(indptr: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
-    rows = indptr.numel() - 1
-    out = torch.empty(indptr[-1].item(), dtype=torch.int32, device=indptr.device)
-    for r in range(rows):
-        s = int(indptr[r].item()); e = int(indptr[r+1].item())
-        if e <= s: continue
-        out[s:e] = r % num_kv_heads
-    return out
-
-def build_head_ids_per_page_head_major(indptr: torch.Tensor, bs: int) -> torch.Tensor:
-    rows = indptr.numel() - 1
-    nnz  = indptr[-1].item()
-    out  = torch.empty(nnz, dtype=torch.int32, device=indptr.device)
-    for r in range(rows):
-        s = int(indptr[r]); e = int(indptr[r+1])
-        if e <= s: continue
-        head_id = r // bs              # <-- head-major instead of r % num_kv_heads
-        out[s:e] = head_id
-    return out
-
-@torch.no_grad()
-def build_head_ids_per_page_req_major(indptr: torch.Tensor,
-                                      num_kv_heads: int) -> torch.Tensor:
-    """
-    Rows are request-major: r = req_id * num_kv_heads + head_id
-    Returns int32 head_id per selected page (length = indptr[-1]).
-    """
-    rows = indptr.numel() - 1
-    nnz  = int(indptr[-1].item())
-    out  = torch.empty(nnz, dtype=torch.int32, device=indptr.device)
-    for r in range(rows):
-        s = int(indptr[r].item()); e = int(indptr[r+1].item())
-        if e <= s: continue
-        out[s:e] = (r % num_kv_heads)
-    return out
     
 @triton.jit
 def set_kv_buffer_kernel(

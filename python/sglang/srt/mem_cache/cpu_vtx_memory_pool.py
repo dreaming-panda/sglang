@@ -12,9 +12,6 @@ from sglang.srt.mem_cache.cpu_gpu_copy_kernels import (
     store_kv_gpu_to_cpu,
     update_landmark_from_cpu,
     naive_copy,
-    build_head_ids_per_page,
-    build_head_ids_per_page_head_major,
-    build_head_ids_per_page_req_major
 )
 
 logger = logging.getLogger(__name__)
@@ -203,8 +200,8 @@ class CPUVTXTokenToKVPool(KVCache):
         store_kv_gpu_to_cpu(
             cpu_k_buffer=cpu_k_buffer,
             cpu_v_buffer=cpu_v_buffer,
-            new_k=cache_k,
-            new_v=cache_v,
+            new_k=cache_k.contiguous(),
+            new_v=cache_v.contiguous(),
             loc=loc,
             page_size=self.page_size,
         )
@@ -231,13 +228,11 @@ class CPUVTXTokenToKVPool(KVCache):
         k_staging = self.k_staging_buffer[layer_idx]
         v_staging = self.v_staging_buffer[layer_idx]
 
-        num_sparse_pages = sparse_indices.shape[0]
+        num_sparse_pages = sparse_indptr[bs * self.head_num].item()
         required_tokens = num_sparse_pages * self.page_size
         current_tokens = k_staging.shape[0]
 
         if required_tokens > current_tokens:
-            # Grow the staging buffers to fit the current workload.
-            # Allocate exactly the number of per-head pages needed to avoid repeated reallocations.
             new_tokens = required_tokens
             new_shape = (new_tokens, 1, self.head_dim)
             k_staging = torch.empty(
@@ -256,21 +251,15 @@ class CPUVTXTokenToKVPool(KVCache):
         assert k_staging.is_contiguous()
         assert v_staging.is_contiguous()
 
-        if num_sparse_pages == 0:
-            return k_staging, v_staging
-
         # Use Triton kernel for efficient CPU->GPU sparse copy
-        head_ids = build_head_ids_per_page_req_major(sparse_indptr, self.head_num)
-        
+        # sparse_indices already contains per-head page indices from Vortex API
         copy_sparse_kv_cpu_to_gpu(
             cpu_k_buffer=self.k_buffer[layer_id - self.start_layer],
             cpu_v_buffer=self.v_buffer[layer_id - self.start_layer],
             gpu_k_staging=k_staging,
             gpu_v_staging=v_staging,
             sparse_indices=sparse_indices,
-            head_ids=head_ids,
             page_size=self.page_size,
-            head_num=self.head_num,
         )
         
         # naive_copy(

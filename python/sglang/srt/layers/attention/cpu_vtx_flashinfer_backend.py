@@ -404,10 +404,6 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
             # self.staging_kv_indices = torch.arange(
             #     num_sparse_pages, dtype=torch.int32, device=self.kv_indptr[0].device
             # )
-            
-            rows = bs * self.num_kv_heads
-            indptr = self.kv_indptr[0][:rows + 1]
-            nnz = indptr[-1].item()
 
             # Row-relative indices buffer
             rows = bs * self.num_kv_heads
