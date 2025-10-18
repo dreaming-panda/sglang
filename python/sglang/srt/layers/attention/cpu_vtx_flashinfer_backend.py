@@ -616,33 +616,28 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
             sparse_indices = self.kv_indices[0][:num_sparse_pages].contiguous()
             sparse_indptr = self.kv_indptr[0][: bs * self.num_kv_heads + 1].contiguous()
 
-            k_staging, v_staging = forward_batch.token_to_kv_pool.copy_sparse_kv_to_gpu(
+            # Copy sparse KV to GPU staging buffer
+            # Non-cached version returns (k_staging, v_staging)
+            # Cached version returns (k_staging, v_staging, staging_kv_indices)
+            
+            import time
+            start_time = time.time()
+            result = forward_batch.token_to_kv_pool.copy_sparse_kv_to_gpu(
                 layer_id=layer.layer_id,
                 sparse_indices=sparse_indices,
-                sparse_indptr=sparse_indptr,
-                bs=bs,
             )
+            end_time = time.time()
+            time = (end_time - start_time) / 1000
+            print(f"[DEBUG] CPU->GPU sparse KV staging copy took {time:.4f} ms")
             
-            # report = verify_staging_mapping(
-            #     cpu_k_buffer=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),   # CPU
-            #     cpu_v_buffer=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id), # CPU
-            #     gpu_k_staging=k_staging,  # still (tokens,1,head_dim)
-            #     gpu_v_staging=v_staging,
-            #     indptr=self.kv_indptr[0][:bs * self.num_kv_heads + 1],
-            #     indices=self.staging_kv_indices,        # absolute slots, e.g., arange(nnz)
-            #     sparse_indices=sparse_indices,  # per-row page ids
-            #     page_size=self.page_size,
-            #     num_kv_heads=self.num_kv_heads,
-            #     head_dim=self.head_dim,
-            #     # Optional: if your row ordering differs, pass a custom row_to_head_id:
-            #     # row_to_head_id=lambda r: r % self.num_kv_heads,
-            #     rows_to_check=4,       # set 0 to check all rows
-            #     pages_per_row=3,       # set 0 to check all pages
-            #     atol=1e-2, rtol=1e-2,
-            # )
+            if len(result) == 3:
+                # Cached version with LRU: use staging_kv_indices for indirection
+                k_staging, v_staging, staging_kv_indices = result
+                self.decode_wrappers[0]._paged_kv_indices_buf = staging_kv_indices
+            else:
+                # Non-cached version: staging buffer is contiguous [0, 1, 2, ...]
+                k_staging, v_staging = result
 
-            # print("staging verify:", report)
-            
             k_staging = k_staging.view(-1, self.page_size, 1, self.head_dim)
             v_staging = v_staging.view(-1, self.page_size, 1, self.head_dim)
             

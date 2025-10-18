@@ -45,7 +45,7 @@ class CPUVTXTokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        layer_skips: Optional[List[int]] = [],
+        layer_skips: Optional[List[int]] = []
     ):
         super().__init__(
             size,
@@ -67,13 +67,18 @@ class CPUVTXTokenToKVPool(KVCache):
 
         k_size, v_size = self.get_kv_size_bytes()
         landmark_size = self.get_landmark_size_bytes()
-        # print(
-        #     f"CPU KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB (CPU), "
-        #     f"V size: {v_size / GB:.2f} GB (CPU), Landmark size: {landmark_size / GB:.2f} GB (GPU)."
-        # )
+        staging_size = self.get_staging_size_bytes()
 
-        # Note: Only landmarks use GPU memory, KV is on CPU
-        self.mem_usage = (landmark_size + k_size + v_size) / GB  # GPU memory usage
+        print(
+            f"CPU KV Cache allocated. #tokens: {size}, "
+            f"K size: {k_size / GB:.2f} GB (CPU), "
+            f"V size: {v_size / GB:.2f} GB (CPU), "
+            f"Landmark size: {landmark_size / GB:.2f} GB (GPU), "
+            f"Staging size: {staging_size / GB:.2f} GB (GPU)"
+        )
+
+        # Note: Landmarks and staging buffers use GPU memory, KV is on CPU
+        self.mem_usage = (landmark_size + staging_size) / GB  # GPU memory usage
 
         assert self.dtype == torch.bfloat16
         assert self.store_dtype == torch.bfloat16
@@ -115,9 +120,11 @@ class CPUVTXTokenToKVPool(KVCache):
                 for _ in range(self.layer_num)
             ]
             
+            # Staging buffers on GPU: same layout as CPU buffers but on GPU
+            # The size is already calculated by profile_max_num_token to account for staging buffer overhead
             self.k_staging_buffer = [
                 torch.zeros(
-                    (10 * 34 * self.page_size * self.head_num, 1, self.head_dim),
+                    ((self.size + self.page_size) * self.head_num, 1, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
@@ -125,7 +132,7 @@ class CPUVTXTokenToKVPool(KVCache):
             ]
             self.v_staging_buffer = [
                 torch.zeros(
-                    (10 * 34 * self.page_size * self.head_num, 1, self.head_dim),
+                    ((self.size + self.page_size) * self.head_num, 1, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
@@ -155,6 +162,15 @@ class CPUVTXTokenToKVPool(KVCache):
             landmark_size_bytes += np.prod(landmark_cache.shape) * landmark_cache.dtype.itemsize
 
         return landmark_size_bytes
+
+    def get_staging_size_bytes(self):
+        assert hasattr(self, "k_staging_buffer")
+        staging_size_bytes = 0
+        for k_staging in self.k_staging_buffer:
+            staging_size_bytes += np.prod(k_staging.shape) * k_staging.dtype.itemsize
+        for v_staging in self.v_staging_buffer:
+            staging_size_bytes += np.prod(v_staging.shape) * v_staging.dtype.itemsize
+        return staging_size_bytes
 
     def get_key_buffer(self, layer_id: int):
         return self.k_buffer[layer_id - self.start_layer]
@@ -222,33 +238,11 @@ class CPUVTXTokenToKVPool(KVCache):
         self,
         layer_id: int,
         sparse_indices: torch.Tensor,
-        sparse_indptr: torch.Tensor,
-        bs: int,
     ):
         layer_idx = layer_id - self.start_layer
         k_staging = self.k_staging_buffer[layer_idx]
         v_staging = self.v_staging_buffer[layer_idx]
-
-        num_sparse_pages = sparse_indptr[bs * self.head_num].item()
-        required_tokens = num_sparse_pages * self.page_size
-        current_tokens = k_staging.shape[0]
-
-        if required_tokens > current_tokens:
-            new_tokens = required_tokens
-            new_shape = (new_tokens, 1, self.head_dim)
-            k_staging = torch.empty(
-                new_shape,
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            v_staging = torch.empty(
-                new_shape,
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.k_staging_buffer[layer_idx] = k_staging
-            self.v_staging_buffer[layer_idx] = v_staging
-
+        
         assert k_staging.is_contiguous()
         assert v_staging.is_contiguous()
 
@@ -278,14 +272,14 @@ class CPUVTXTokenToKVPool(KVCache):
         # )
         # end_time_2 = time.time()
         
-        # first_time = end_time_1 - start_time_1
+        # first_time = (end_time_1 - start_time_1) / 1000
         # second_time = end_time_2 - start_time_2
         # if second_time < first_time:
         #     k_staging, v_staging = self.k_staging_buffer[layer_idx], self.v_staging_buffer[layer_idx]
         #     print("Using tiled version")
         # else:
         #     print("Using original version")
-        
+        # print(f"copy_sparse_kv_to_gpu time: {first_time:.4f} seconds")
         
         # naive_copy(
         #     cpu_k=self.k_buffer[layer_id - self.start_layer],

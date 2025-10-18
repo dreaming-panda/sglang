@@ -302,11 +302,11 @@ def update_landmark_from_cpu(
     num_kv_head: int,
     head_dim: int
 ):
-    
+
     NNZ = loc.shape[0]
     NUM_KV_HEAD = num_kv_head
     HEAD_DIM = head_dim
-    
+
     update_landmark_buffer_kernel[(NNZ, NUM_KV_HEAD)](
         cpu_k_buffer,
         gpu_landmark,
@@ -316,3 +316,225 @@ def update_landmark_from_cpu(
         HEAD_DIM,
         page_size
     )
+
+
+@triton.jit
+def cpu_to_gpu_sparse_copy_with_slots_kernel(
+    cpu_k_ptr, cpu_v_ptr,
+    gpu_k_ptr, gpu_v_ptr,
+    src_page_ids_ptr,        # [num_pages_to_copy] - CPU page IDs to copy
+    dst_staging_slots_ptr,   # [num_pages_to_copy] - staging slots to write to
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_SPARSE_PAGES: tl.constexpr,
+):
+    """
+    Copy specific pages from CPU to specific staging slots on GPU.
+
+    Unlike the contiguous version, this allows non-contiguous placement
+    in the staging buffer based on cache slot allocation.
+    """
+    token_idx = tl.program_id(0)
+    page_idx = token_idx // PAGE_SIZE # which sparse page it belongs to
+    token_offset = token_idx % PAGE_SIZE # offset within the page
+    if page_idx >= NUM_SPARSE_PAGES:
+        return
+
+    # Which CPU page to copy from
+    src_page_id = tl.load(src_page_ids_ptr + page_idx)
+    # Which staging slot to copy to
+    dst_slot = tl.load(dst_staging_slots_ptr + page_idx)
+
+    # Linear indices in the buffers
+    src_linear_idx = src_page_id * PAGE_SIZE + token_offset
+    dst_linear_idx = dst_slot * PAGE_SIZE + token_offset
+
+    dim = tl.arange(0, HEAD_DIM)
+    tl.store(gpu_k_ptr + dst_linear_idx * HEAD_DIM + dim,
+             tl.load(cpu_k_ptr + src_linear_idx * HEAD_DIM + dim))
+    tl.store(gpu_v_ptr + dst_linear_idx * HEAD_DIM + dim,
+             tl.load(cpu_v_ptr + src_linear_idx * HEAD_DIM + dim))
+
+
+def copy_pages_to_staging_slots(
+    cpu_k_buffer: torch.Tensor,
+    cpu_v_buffer: torch.Tensor,
+    gpu_k_staging: torch.Tensor,
+    gpu_v_staging: torch.Tensor,
+    src_page_ids: torch.Tensor,      # [num_pages] - which CPU pages to copy
+    dst_staging_slots: torch.Tensor, # [num_pages] - which staging slots to write to
+    page_size: int,
+):
+    """
+    Copy specific pages from CPU to specific staging buffer slots on GPU.
+    Used for cache-based copying where slots may be non-contiguous.
+    """
+    assert cpu_k_buffer.is_pinned() and cpu_v_buffer.is_pinned()
+    assert gpu_k_staging.is_cuda and gpu_v_staging.is_cuda
+    assert cpu_k_buffer.dim() == 3 and cpu_k_buffer.shape[1] == 1
+    assert gpu_k_staging.dim() == 3 and gpu_k_staging.shape[1] == 1
+
+    num_sparse_pages = src_page_ids.shape[0]
+    if num_sparse_pages == 0:
+        return
+
+    head_dim = int(cpu_k_buffer.shape[2])
+    grid = (num_sparse_pages * page_size,)
+
+    cpu_to_gpu_sparse_copy_with_slots_kernel[grid](
+        cpu_k_buffer,
+        cpu_v_buffer,
+        gpu_k_staging,
+        gpu_v_staging,
+        src_page_ids,
+        dst_staging_slots,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
+        NUM_SPARSE_PAGES=num_sparse_pages,
+    )
+
+
+@triton.jit
+def assign_staging_slots_kernel(
+    src_page_ids_ptr,        # [num_pages] - CPU page IDs (may have duplicates)
+    staging_slot_map_ptr,    # [max_page_id] - maps page_id -> staging_slot (-1 if not assigned yet)
+    slot_counter_ptr,        # [1] - atomic counter for assigning new staging slots
+    dst_staging_slots_ptr,   # [num_pages] - OUTPUT: staging slots for each input page
+    MAX_PAGE_ID: tl.constexpr,
+    NUM_PAGES: tl.constexpr,
+):
+    """
+    First pass: Assign staging slots to unique pages.
+    One thread per page_idx in the input.
+    """
+    page_idx = tl.program_id(0)
+
+    if page_idx >= NUM_PAGES:
+        return
+
+    src_page_id = tl.load(src_page_ids_ptr + page_idx)
+
+    # Clamp to valid range
+    if src_page_id < 0 or src_page_id >= MAX_PAGE_ID:
+        tl.store(dst_staging_slots_ptr + page_idx, 0)  # Default to slot 0
+        return
+
+    # Check if this page_id already has a staging slot assigned
+    existing_slot = tl.load(staging_slot_map_ptr + src_page_id)
+
+    if existing_slot == -1:
+        # This page needs a new slot - atomically claim one
+        new_slot = tl.atomic_add(slot_counter_ptr, 1)
+        # Try to be the first to assign this slot to this page_id
+        old_slot = tl.atomic_cas(staging_slot_map_ptr + src_page_id, -1, new_slot)
+        if old_slot == -1:
+            # We won - use our new_slot
+            my_slot = new_slot
+        else:
+            # Someone else won - use their slot
+            my_slot = old_slot
+    else:
+        # Slot already assigned (duplicate page)
+        my_slot = existing_slot
+
+    # Store the staging slot for this position in the output
+    tl.store(dst_staging_slots_ptr + page_idx, my_slot)
+
+
+@triton.jit
+def copy_with_assigned_slots_kernel(
+    cpu_k_ptr, cpu_v_ptr,
+    gpu_k_ptr, gpu_v_ptr,
+    src_page_ids_ptr,        # [num_pages] - CPU page IDs
+    dst_staging_slots_ptr,   # [num_pages] - staging slots for each page
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_PAGES: tl.constexpr,
+):
+    """
+    Second pass: Copy data using pre-assigned staging slots.
+    """
+    token_idx = tl.program_id(0)
+    page_idx = token_idx // PAGE_SIZE
+    token_offset = token_idx % PAGE_SIZE
+
+    if page_idx >= NUM_PAGES:
+        return
+
+    src_page_id = tl.load(src_page_ids_ptr + page_idx)
+    dst_slot = tl.load(dst_staging_slots_ptr + page_idx)
+
+    # Copy the data
+    src_linear_idx = src_page_id * PAGE_SIZE + token_offset
+    dst_linear_idx = dst_slot * PAGE_SIZE + token_offset
+
+    dim = tl.arange(0, HEAD_DIM)
+    tl.store(gpu_k_ptr + dst_linear_idx * HEAD_DIM + dim,
+             tl.load(cpu_k_ptr + src_linear_idx * HEAD_DIM + dim))
+    tl.store(gpu_v_ptr + dst_linear_idx * HEAD_DIM + dim,
+             tl.load(cpu_v_ptr + src_linear_idx * HEAD_DIM + dim))
+
+
+def copy_pages_to_staging_slots_dedup(
+    cpu_k_buffer: torch.Tensor,
+    cpu_v_buffer: torch.Tensor,
+    gpu_k_staging: torch.Tensor,
+    gpu_v_staging: torch.Tensor,
+    src_page_ids: torch.Tensor,      # [num_pages] - which CPU pages to copy (may have duplicates)
+    page_size: int,
+    max_page_id: int,
+):
+    """
+    Copy pages from CPU to GPU with automatic deduplication.
+
+    Uses an atomic slot counter and page_id->slot mapping to ensure each unique
+    page is copied only once, even if it appears multiple times in src_page_ids.
+
+    Returns:
+        staging_slots: [num_pages] tensor mapping each src_page_ids[i] to its staging slot
+    """
+    assert cpu_k_buffer.is_pinned() and cpu_v_buffer.is_pinned()
+    assert gpu_k_staging.is_cuda and gpu_v_staging.is_cuda
+    assert cpu_k_buffer.dim() == 3 and cpu_k_buffer.shape[1] == 1
+    assert gpu_k_staging.dim() == 3 and gpu_k_staging.shape[1] == 1
+
+    num_pages = src_page_ids.shape[0]
+    if num_pages == 0:
+        return torch.empty(0, dtype=torch.int32, device=src_page_ids.device)
+
+    # Allocate mapping: page_id -> staging_slot (-1 = not assigned)
+    staging_slot_map = torch.full((max_page_id,), -1, dtype=torch.int32, device=gpu_k_staging.device)
+
+    # Atomic counter for assigning new staging slots
+    slot_counter = torch.zeros(1, dtype=torch.int32, device=gpu_k_staging.device)
+
+    # Output: staging slot for each input page
+    dst_staging_slots = torch.zeros(num_pages, dtype=torch.int32, device=gpu_k_staging.device)
+
+    head_dim = int(cpu_k_buffer.shape[2])
+
+    # Pass 1: Assign staging slots (one thread per page)
+    assign_staging_slots_kernel[(num_pages,)](
+        src_page_ids,
+        staging_slot_map,
+        slot_counter,
+        dst_staging_slots,
+        MAX_PAGE_ID=max_page_id,
+        NUM_PAGES=num_pages,
+    )
+
+    # Pass 2: Copy data (all threads, using assigned slots)
+    grid = (num_pages * page_size,)
+    copy_with_assigned_slots_kernel[grid](
+        cpu_k_buffer,
+        cpu_v_buffer,
+        gpu_k_staging,
+        gpu_v_staging,
+        src_page_ids,
+        dst_staging_slots,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
+        NUM_PAGES=num_pages,
+    )
+
+    return dst_staging_slots
