@@ -626,6 +626,7 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
                 layer_id=layer.layer_id,
                 sparse_indices=sparse_indices,
             )
+            torch.cuda.synchronize()
             end_time = time.time()
             time = (end_time - start_time) / 1000
             print(f"[DEBUG] CPU->GPU sparse KV staging copy took {time:.4f} ms")

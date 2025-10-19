@@ -400,12 +400,13 @@ def assign_staging_slots_kernel(
     staging_slot_map_ptr,    # [max_page_id] - maps page_id -> staging_slot (-1 if not assigned yet)
     slot_counter_ptr,        # [1] - atomic counter for assigning new staging slots
     dst_staging_slots_ptr,   # [num_pages] - OUTPUT: staging slots for each input page
+    should_copy_bitmap_ptr,  # [num_pages] - OUTPUT: 1 if this page_idx should copy, 0 if duplicate
     MAX_PAGE_ID: tl.constexpr,
     NUM_PAGES: tl.constexpr,
 ):
     """
-    First pass: Assign staging slots to unique pages.
-    One thread per page_idx in the input.
+    Assign staging slots and mark which page_idx should perform the copy.
+    Only the first occurrence of each unique page_id will be marked for copying.
     """
     page_idx = tl.program_id(0)
 
@@ -416,29 +417,35 @@ def assign_staging_slots_kernel(
 
     # Clamp to valid range
     if src_page_id < 0 or src_page_id >= MAX_PAGE_ID:
-        tl.store(dst_staging_slots_ptr + page_idx, 0)  # Default to slot 0
+        tl.store(dst_staging_slots_ptr + page_idx, 0)
+        tl.store(should_copy_bitmap_ptr + page_idx, 0)
         return
 
     # Check if this page_id already has a staging slot assigned
     existing_slot = tl.load(staging_slot_map_ptr + src_page_id)
 
+    should_copy = 0
     if existing_slot == -1:
         # This page needs a new slot - atomically claim one
         new_slot = tl.atomic_add(slot_counter_ptr, 1)
         # Try to be the first to assign this slot to this page_id
         old_slot = tl.atomic_cas(staging_slot_map_ptr + src_page_id, -1, new_slot)
         if old_slot == -1:
-            # We won - use our new_slot
+            # We won - this is the first occurrence, we should copy
             my_slot = new_slot
+            should_copy = 1
         else:
-            # Someone else won - use their slot
+            # Someone else won - use their slot, don't copy (duplicate)
             my_slot = old_slot
+            should_copy = 0
     else:
-        # Slot already assigned (duplicate page)
+        # Slot already assigned (duplicate page) - don't copy
         my_slot = existing_slot
+        should_copy = 0
 
-    # Store the staging slot for this position in the output
+    # Store the staging slot and copy flag for this position
     tl.store(dst_staging_slots_ptr + page_idx, my_slot)
+    tl.store(should_copy_bitmap_ptr + page_idx, should_copy)
 
 
 @triton.jit
@@ -447,12 +454,14 @@ def copy_with_assigned_slots_kernel(
     gpu_k_ptr, gpu_v_ptr,
     src_page_ids_ptr,        # [num_pages] - CPU page IDs
     dst_staging_slots_ptr,   # [num_pages] - staging slots for each page
+    should_copy_bitmap_ptr,  # [num_pages] - 1 if should copy, 0 if duplicate
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_PAGES: tl.constexpr,
 ):
     """
-    Second pass: Copy data using pre-assigned staging slots.
+    Copy data for pages marked as should_copy.
+    Duplicates are skipped (should_copy=0).
     """
     token_idx = tl.program_id(0)
     page_idx = token_idx // PAGE_SIZE
@@ -461,18 +470,22 @@ def copy_with_assigned_slots_kernel(
     if page_idx >= NUM_PAGES:
         return
 
-    src_page_id = tl.load(src_page_ids_ptr + page_idx)
-    dst_slot = tl.load(dst_staging_slots_ptr + page_idx)
+    # Check if this page should be copied (first occurrence of this page_id)
+    should_copy = tl.load(should_copy_bitmap_ptr + page_idx)
 
-    # Copy the data
-    src_linear_idx = src_page_id * PAGE_SIZE + token_offset
-    dst_linear_idx = dst_slot * PAGE_SIZE + token_offset
+    if should_copy == 1:
+        src_page_id = tl.load(src_page_ids_ptr + page_idx)
+        dst_slot = tl.load(dst_staging_slots_ptr + page_idx)
 
-    dim = tl.arange(0, HEAD_DIM)
-    tl.store(gpu_k_ptr + dst_linear_idx * HEAD_DIM + dim,
-             tl.load(cpu_k_ptr + src_linear_idx * HEAD_DIM + dim))
-    tl.store(gpu_v_ptr + dst_linear_idx * HEAD_DIM + dim,
-             tl.load(cpu_v_ptr + src_linear_idx * HEAD_DIM + dim))
+        # Copy the data
+        src_linear_idx = src_page_id * PAGE_SIZE + token_offset
+        dst_linear_idx = dst_slot * PAGE_SIZE + token_offset
+
+        dim = tl.arange(0, HEAD_DIM)
+        tl.store(gpu_k_ptr + dst_linear_idx * HEAD_DIM + dim,
+                 tl.load(cpu_k_ptr + src_linear_idx * HEAD_DIM + dim))
+        tl.store(gpu_v_ptr + dst_linear_idx * HEAD_DIM + dim,
+                 tl.load(cpu_v_ptr + src_linear_idx * HEAD_DIM + dim))
 
 
 def copy_pages_to_staging_slots_dedup(
@@ -484,15 +497,6 @@ def copy_pages_to_staging_slots_dedup(
     page_size: int,
     max_page_id: int,
 ):
-    """
-    Copy pages from CPU to GPU with automatic deduplication.
-
-    Uses an atomic slot counter and page_id->slot mapping to ensure each unique
-    page is copied only once, even if it appears multiple times in src_page_ids.
-
-    Returns:
-        staging_slots: [num_pages] tensor mapping each src_page_ids[i] to its staging slot
-    """
     assert cpu_k_buffer.is_pinned() and cpu_v_buffer.is_pinned()
     assert gpu_k_staging.is_cuda and gpu_v_staging.is_cuda
     assert cpu_k_buffer.dim() == 3 and cpu_k_buffer.shape[1] == 1
@@ -511,19 +515,23 @@ def copy_pages_to_staging_slots_dedup(
     # Output: staging slot for each input page
     dst_staging_slots = torch.zeros(num_pages, dtype=torch.int32, device=gpu_k_staging.device)
 
+    # Bitmap: which page_idx should perform the copy (True = first occurrence, False = duplicate)
+    should_copy_bitmap = torch.zeros(num_pages, dtype=torch.bool, device=gpu_k_staging.device)
+
     head_dim = int(cpu_k_buffer.shape[2])
 
-    # Pass 1: Assign staging slots (one thread per page)
+    # Pass 1: Assign staging slots and mark which pages should copy
     assign_staging_slots_kernel[(num_pages,)](
         src_page_ids,
         staging_slot_map,
         slot_counter,
         dst_staging_slots,
+        should_copy_bitmap,
         MAX_PAGE_ID=max_page_id,
         NUM_PAGES=num_pages,
     )
 
-    # Pass 2: Copy data (all threads, using assigned slots)
+    # Pass 2: Copy data only for pages marked should_copy=1
     grid = (num_pages * page_size,)
     copy_with_assigned_slots_kernel[grid](
         cpu_k_buffer,
@@ -532,6 +540,7 @@ def copy_pages_to_staging_slots_dedup(
         gpu_v_staging,
         src_page_ids,
         dst_staging_slots,
+        should_copy_bitmap,
         PAGE_SIZE=page_size,
         HEAD_DIM=head_dim,
         NUM_PAGES=num_pages,

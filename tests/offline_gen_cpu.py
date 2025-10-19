@@ -30,7 +30,7 @@ def main():
         vortex_page_reserved_bos=1,
         vortex_page_reserved_eos=1,
         vortex_layers_skip=[],  # Skip first layer for Vortex
-        enable_cpu_vtx_cache=True,
+        enable_cpu_vtx_cache=False,
 
         # Memory settings
         disable_overlap_schedule=True,
