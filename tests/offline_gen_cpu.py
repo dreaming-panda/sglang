@@ -22,6 +22,7 @@ def main():
         model_path=model_name,
         disable_cuda_graph=True,
         page_size=16,
+        mem_fraction_static=0.5,
 
         # Vortex sparse attention settings
         attention_backend="cpu_vtx_flashinfer",  # Use CPU-based backend
@@ -30,7 +31,7 @@ def main():
         vortex_page_reserved_bos=1,
         vortex_page_reserved_eos=1,
         vortex_layers_skip=[],  # Skip first layer for Vortex
-        enable_cpu_vtx_cache=False,
+        enable_cpu_vtx_cache=True,
 
         # Memory settings
         disable_overlap_schedule=True,
@@ -56,7 +57,7 @@ def main():
     ]
 
     # Test with multiple batches
-    prompts = prompts * 4
+    prompts = prompts * 16
 
     print(f"Testing CPU-based KV cache with {len(prompts)} prompts")
     print(f"Vortex config: {llm.server_args.vortex_num_selected_pages} selected pages, "

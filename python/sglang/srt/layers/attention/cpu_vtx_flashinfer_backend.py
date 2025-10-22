@@ -628,8 +628,8 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
             )
             torch.cuda.synchronize()
             end_time = time.time()
-            time = (end_time - start_time) / 1000
-            print(f"[DEBUG] CPU->GPU sparse KV staging copy took {time:.4f} ms")
+            final = (end_time - start_time) * 1000.0  # Convert seconds to milliseconds
+            # print(f"[DEBUG] CPU->GPU sparse KV staging copy took {final:.4f} ms")
             
             if len(result) == 3:
                 # Cached version with LRU: use staging_kv_indices for indirection

@@ -246,11 +246,11 @@ class CPUVTXTokenToKVPool(KVCache):
         assert k_staging.is_contiguous()
         assert v_staging.is_contiguous()
 
+        torch.cuda.synchronize()
         # Use Triton kernel for efficient CPU->GPU sparse copy
         # sparse_indices already contains per-head page indices from Vortex API
         import time
-
-        # start_time_1 = time.time()
+        start_time = time.time()
         copy_sparse_kv_cpu_to_gpu(
             cpu_k_buffer=self.k_buffer[layer_id - self.start_layer],
             cpu_v_buffer=self.v_buffer[layer_id - self.start_layer],
@@ -259,7 +259,11 @@ class CPUVTXTokenToKVPool(KVCache):
             sparse_indices=sparse_indices,
             page_size=self.page_size,
         )
-        # end_time_1 = time.time()
+        
+        torch.cuda.synchronize()
+        end_time = time.time()
+        final = (end_time - start_time) * 1000.0
+        print(f"[DEBUG] CPU->GPU sparse KV staging all copy took {final:.4f} ms")
         
         # start_time_2 = time.time()
         # copy_sparse_kv_cpu_to_gpu_tiled(

@@ -7,6 +7,7 @@ Each block handles one page to maximize parallelism.
 import torch
 import triton
 import triton.language as tl
+import time
 
 
 @triton.jit
@@ -181,27 +182,144 @@ def set_kv_buffer_kernel(
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr
 ):
-    
+
     token_id = tl.program_id(0)
     if token_id >= NNZ:
         return
-    head_id = tl.program_id(1)    
+    head_id = tl.program_id(1)
     dim = tl.arange(0, HEAD_DIM)
-    
+
     src_ptr = token_id * NUM_KV_HEAD * HEAD_DIM + head_id * HEAD_DIM + dim
     src_k = tl.load(new_k + src_ptr)
     src_v = tl.load(new_v + src_ptr)
-    
+
     token_position = tl.load(loc + token_id)
     position_trans = (token_position // PAGE_SIZE) * (PAGE_SIZE * NUM_KV_HEAD) + \
         head_id * PAGE_SIZE + token_position %  PAGE_SIZE
-    
+
     dst_k_ptr = k_cache + position_trans * HEAD_DIM + dim
     dst_v_ptr = v_cache + position_trans * HEAD_DIM + dim
-    
+
     tl.store(dst_k_ptr, src_k)
     tl.store(dst_v_ptr, src_v)
-    
+
+
+@triton.jit
+def set_kv_buffer_cpu_and_gpu_kernel(
+    cpu_k_cache,
+    cpu_v_cache,
+    gpu_k_staging,
+    gpu_v_staging,
+    new_k,
+    new_v,
+    loc,
+    cpu_to_gpu_slot_map_ptr,
+    NUM_KV_HEAD: tl.constexpr,
+    NNZ: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    MAX_PAGE_ID: tl.constexpr,
+):
+    """
+    Fused kernel: Store KV data to CPU and update GPU cache if present.
+
+    If the page is already in GPU staging buffer, we update both CPU and GPU
+    simultaneously instead of invalidating and re-copying later.
+    """
+    token_id = tl.program_id(0)
+    if token_id >= NNZ:
+        return
+    head_id = tl.program_id(1)
+    dim = tl.arange(0, HEAD_DIM)
+
+    # Load source K/V from GPU
+    src_ptr = token_id * NUM_KV_HEAD * HEAD_DIM + head_id * HEAD_DIM + dim
+    src_k = tl.load(new_k + src_ptr)
+    src_v = tl.load(new_v + src_ptr)
+
+    # Compute destination position in CPU cache
+    token_position = tl.load(loc + token_id)
+    cpu_position_trans = (token_position // PAGE_SIZE) * (PAGE_SIZE * NUM_KV_HEAD) + \
+        head_id * PAGE_SIZE + token_position % PAGE_SIZE
+
+    # Always store to CPU cache
+    cpu_dst_k_ptr = cpu_k_cache + cpu_position_trans * HEAD_DIM + dim
+    cpu_dst_v_ptr = cpu_v_cache + cpu_position_trans * HEAD_DIM + dim
+    tl.store(cpu_dst_k_ptr, src_k)
+    tl.store(cpu_dst_v_ptr, src_v)
+
+    # Check if this page is also in GPU staging buffer
+    page_id = (token_position // PAGE_SIZE) * NUM_KV_HEAD + head_id
+
+    if page_id < MAX_PAGE_ID:
+        # Read the GPU slot for this page
+        gpu_slot = tl.load(cpu_to_gpu_slot_map_ptr + page_id)
+
+        # If this page is cached in GPU, also update the GPU copy
+        if gpu_slot >= 0:
+            # Compute position in GPU staging buffer
+            gpu_position_trans = gpu_slot * PAGE_SIZE + (token_position % PAGE_SIZE)
+
+            # Update GPU staging buffer
+            gpu_dst_k_ptr = gpu_k_staging + gpu_position_trans * HEAD_DIM + dim
+            gpu_dst_v_ptr = gpu_v_staging + gpu_position_trans * HEAD_DIM + dim
+            tl.store(gpu_dst_k_ptr, src_k)
+            tl.store(gpu_dst_v_ptr, src_v)
+
+
+def store_kv_cpu_and_gpu(
+    cpu_k_buffer: torch.Tensor,
+    cpu_v_buffer: torch.Tensor,
+    gpu_k_staging: torch.Tensor,
+    gpu_v_staging: torch.Tensor,
+    new_k: torch.Tensor,
+    new_v: torch.Tensor,
+    loc: torch.LongTensor,
+    page_size: int,
+    cpu_to_gpu_slot_map: torch.Tensor,
+    max_page_id: int,
+):
+    """
+    Fused operation: Store KV data to CPU cache and update GPU staging buffer if present.
+
+    This kernel writes to both CPU and GPU simultaneously:
+    1. Always writes new K/V data to CPU cache pages
+    2. If the page is already in GPU staging buffer, also updates the GPU copy
+
+    This avoids the need to invalidate and re-copy later, keeping CPU and GPU in sync.
+
+    Args:
+        cpu_k_buffer: CPU K cache [num_pages, num_heads, page_size, head_dim]
+        cpu_v_buffer: CPU V cache [num_pages, num_heads, page_size, head_dim]
+        gpu_k_staging: GPU K staging buffer [num_slots * page_size, head_dim]
+        gpu_v_staging: GPU V staging buffer [num_slots * page_size, head_dim]
+        new_k: New K data from GPU [batch_size, num_heads, head_dim]
+        new_v: New V data from GPU [batch_size, num_heads, head_dim]
+        loc: Token positions in cache [batch_size]
+        page_size: Tokens per page
+        cpu_to_gpu_slot_map: CPU page ID -> GPU slot mapping [-1 if not cached]
+        max_page_id: Maximum valid page ID
+    """
+    NNZ = loc.shape[0]
+    NUM_KV_HEAD = new_k.shape[1]
+    HEAD_DIM = new_k.shape[2]
+
+    set_kv_buffer_cpu_and_gpu_kernel[(NNZ, NUM_KV_HEAD)](
+        cpu_k_buffer,
+        cpu_v_buffer,
+        gpu_k_staging,
+        gpu_v_staging,
+        new_k,
+        new_v,
+        loc,
+        cpu_to_gpu_slot_map,
+        NUM_KV_HEAD,
+        NNZ,
+        HEAD_DIM,
+        page_size,
+        max_page_id,
+    )
+
 
 def store_kv_gpu_to_cpu(
     cpu_k_buffer: torch.Tensor,
@@ -392,77 +510,110 @@ def copy_pages_to_staging_slots(
         HEAD_DIM=head_dim,
         NUM_SPARSE_PAGES=num_sparse_pages,
     )
-
+    
 
 @triton.jit
-def assign_staging_slots_kernel(
-    src_page_ids_ptr,        # [num_pages] - CPU page IDs (may have duplicates)
-    staging_slot_map_ptr,    # [max_page_id] - maps page_id -> staging_slot (-1 if not assigned yet)
-    slot_counter_ptr,        # [1] - atomic counter for assigning new staging slots
-    dst_staging_slots_ptr,   # [num_pages] - OUTPUT: staging slots for each input page
-    should_copy_bitmap_ptr,  # [num_pages] - OUTPUT: 1 if this page_idx should copy, 0 if duplicate
+def mark_and_allocate_unique_kernel(
+    src_page_ids_ptr,
+    cpu_to_gpu_slot_map_ptr,
+    gpu_to_cpu_page_map_ptr,
+    available_slots_ptr,
+    alloc_counter_ptr,
+    owners_bitmap_ptr,
+    overflow_flag_ptr,
     MAX_PAGE_ID: tl.constexpr,
-    NUM_PAGES: tl.constexpr,
+    N: tl.constexpr,
+    NUM_AVAILABLE: tl.constexpr,
 ):
     """
-    Assign staging slots and mark which page_idx should perform the copy.
-    Only the first occurrence of each unique page_id will be marked for copying.
+    Mark unique pages and allocate slots.
+
+    Key insight: We need to copy ALL unique pages in this batch, including cache hits.
+    Only skip duplicates WITHIN this batch.
     """
-    page_idx = tl.program_id(0)
-
-    if page_idx >= NUM_PAGES:
+    idx = tl.program_id(0)
+    if idx >= N:
         return
 
-    src_page_id = tl.load(src_page_ids_ptr + page_idx)
-
-    # Clamp to valid range
-    if src_page_id < 0 or src_page_id >= MAX_PAGE_ID:
-        tl.store(dst_staging_slots_ptr + page_idx, 0)
-        tl.store(should_copy_bitmap_ptr + page_idx, 0)
+    pid = tl.load(src_page_ids_ptr + idx)
+    if (pid < 0) or (pid >= MAX_PAGE_ID):
+        tl.store(owners_bitmap_ptr + idx, 0)
         return
 
-    # Check if this page_id already has a staging slot assigned
-    existing_slot = tl.load(staging_slot_map_ptr + src_page_id)
+    # First, check if already cached (non-atomic read is fast)
+    existing_slot = tl.load(cpu_to_gpu_slot_map_ptr + pid)
 
-    should_copy = 0
-    if existing_slot == -1:
-        # This page needs a new slot - atomically claim one
-        new_slot = tl.atomic_add(slot_counter_ptr, 1)
-        # Try to be the first to assign this slot to this page_id
-        old_slot = tl.atomic_cas(staging_slot_map_ptr + src_page_id, -1, new_slot)
-        if old_slot == -1:
-            # We won - this is the first occurrence, we should copy
-            my_slot = new_slot
-            should_copy = 1
-        else:
-            # Someone else won - use their slot, don't copy (duplicate)
-            my_slot = old_slot
-            should_copy = 0
+    # If already cached (>= 0) or being allocated by another thread (-2), not an owner
+    if existing_slot != -1:
+        # Cache hit from previous batch - no need to copy
+        tl.store(owners_bitmap_ptr + idx, 0)
+        return
+
+    # Not cached (-1), try to claim ownership with CAS
+    prev = tl.atomic_cas(cpu_to_gpu_slot_map_ptr + pid, -1, -2)
+
+    if prev == -1:
+        # Won the race - we're the first occurrence of this page_id in this batch
+        # Allocate a new slot
+        alloc_idx = tl.atomic_add(alloc_counter_ptr, 1)
+
+        if alloc_idx >= NUM_AVAILABLE:
+            # Overflow - revert the sentinel
+            tl.store(cpu_to_gpu_slot_map_ptr + pid, -1)
+            tl.store(owners_bitmap_ptr + idx, 0)
+            tl.store(overflow_flag_ptr, 1)
+            return
+
+        # Get the slot from available_slots
+        new_slot = tl.load(available_slots_ptr + alloc_idx)
+
+        # Eviction: clear old mapping if this slot was occupied
+        old_pid = tl.load(gpu_to_cpu_page_map_ptr + new_slot)
+        if (old_pid >= 0) and (old_pid < MAX_PAGE_ID):
+            tl.store(cpu_to_gpu_slot_map_ptr + old_pid, -1)
+
+        # Set new bidirectional mapping
+        tl.store(gpu_to_cpu_page_map_ptr + new_slot, pid)
+        tl.store(cpu_to_gpu_slot_map_ptr + pid, new_slot)
+
+        # Mark as owner (should copy)
+        tl.store(owners_bitmap_ptr + idx, 1)
     else:
-        # Slot already assigned (duplicate page) - don't copy
-        my_slot = existing_slot
-        should_copy = 0
+        # Lost the race - another thread claimed it first
+        tl.store(owners_bitmap_ptr + idx, 0)
 
-    # Store the staging slot and copy flag for this position
-    tl.store(dst_staging_slots_ptr + page_idx, my_slot)
-    tl.store(should_copy_bitmap_ptr + page_idx, should_copy)
-
+@triton.jit
+def materialize_slots_kernel(
+    src_page_ids_ptr,
+    cpu_to_gpu_slot_map_ptr,
+    dst_staging_slots_ptr,
+    N: tl.constexpr,
+    MAX_PAGE_ID: tl.constexpr,
+):
+    idx = tl.program_id(0)
+    if idx >= N:
+        return
+    
+    pid = tl.load(src_page_ids_ptr + idx)
+    if (pid < 0) or (pid >= MAX_PAGE_ID):
+        # Invalid page ID - use -1 as error marker
+        tl.store(dst_staging_slots_ptr + idx, -1)
+        return
+    
+    slot = tl.load(cpu_to_gpu_slot_map_ptr + pid)
+    tl.store(dst_staging_slots_ptr + idx, slot)
 
 @triton.jit
 def copy_with_assigned_slots_kernel(
     cpu_k_ptr, cpu_v_ptr,
     gpu_k_ptr, gpu_v_ptr,
-    src_page_ids_ptr,        # [num_pages] - CPU page IDs
-    dst_staging_slots_ptr,   # [num_pages] - staging slots for each page
-    should_copy_bitmap_ptr,  # [num_pages] - 1 if should copy, 0 if duplicate
+    src_page_ids_ptr,
+    dst_staging_slots_ptr,
+    should_copy_bitmap_ptr,
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_PAGES: tl.constexpr,
 ):
-    """
-    Copy data for pages marked as should_copy.
-    Duplicates are skipped (should_copy=0).
-    """
     token_idx = tl.program_id(0)
     page_idx = token_idx // PAGE_SIZE
     token_offset = token_idx % PAGE_SIZE
@@ -470,22 +621,77 @@ def copy_with_assigned_slots_kernel(
     if page_idx >= NUM_PAGES:
         return
 
-    # Check if this page should be copied (first occurrence of this page_id)
     should_copy = tl.load(should_copy_bitmap_ptr + page_idx)
-
+    
     if should_copy == 1:
         src_page_id = tl.load(src_page_ids_ptr + page_idx)
         dst_slot = tl.load(dst_staging_slots_ptr + page_idx)
+        
+        # Only copy if we have a valid slot
+        if dst_slot >= 0:
+            src_linear_idx = src_page_id * PAGE_SIZE + token_offset
+            dst_linear_idx = dst_slot * PAGE_SIZE + token_offset
 
-        # Copy the data
-        src_linear_idx = src_page_id * PAGE_SIZE + token_offset
-        dst_linear_idx = dst_slot * PAGE_SIZE + token_offset
+            dim = tl.arange(0, HEAD_DIM)
+            tl.store(gpu_k_ptr + dst_linear_idx * HEAD_DIM + dim,
+                     tl.load(cpu_k_ptr + src_linear_idx * HEAD_DIM + dim))
+            tl.store(gpu_v_ptr + dst_linear_idx * HEAD_DIM + dim,
+                     tl.load(cpu_v_ptr + src_linear_idx * HEAD_DIM + dim))
 
-        dim = tl.arange(0, HEAD_DIM)
-        tl.store(gpu_k_ptr + dst_linear_idx * HEAD_DIM + dim,
-                 tl.load(cpu_k_ptr + src_linear_idx * HEAD_DIM + dim))
-        tl.store(gpu_v_ptr + dst_linear_idx * HEAD_DIM + dim,
-                 tl.load(cpu_v_ptr + src_linear_idx * HEAD_DIM + dim))
+
+@triton.jit
+def mark_and_allocate_unique_kernel_sharded(
+    src_page_ids_ptr,
+    cpu_to_gpu_slot_map_ptr,
+    gpu_to_cpu_page_map_ptr,
+    available_slots_ptr,
+    alloc_counters_ptr,
+    bucket_offsets_ptr,
+    bucket_sizes_ptr,
+    owners_bitmap_ptr,
+    overflow_flag_ptr,
+    MAX_PAGE_ID: tl.constexpr,
+    N: tl.constexpr,
+    NB: tl.constexpr,
+):
+    i = tl.program_id(0)
+    if i >= N:
+        return
+
+    pid = tl.load(src_page_ids_ptr + i).to(tl.int32)
+    if (pid < 0) or (pid >= MAX_PAGE_ID):
+        tl.store(owners_bitmap_ptr + i, 0)
+        return
+
+    slot = tl.load(cpu_to_gpu_slot_map_ptr + pid)
+    if slot != -1:
+        tl.store(owners_bitmap_ptr + i, 0)
+        return
+
+    prev = tl.atomic_cas(cpu_to_gpu_slot_map_ptr + pid, -1, -2)
+    if prev != -1:
+        tl.store(owners_bitmap_ptr + i, 0)
+        return
+
+    bucket = pid & (NB - 1)
+    base = tl.load(bucket_offsets_ptr + bucket)
+    size = tl.load(bucket_sizes_ptr + bucket)
+
+    local_idx = tl.atomic_add(alloc_counters_ptr + bucket, 1)
+    if local_idx >= size:
+        tl.store(cpu_to_gpu_slot_map_ptr + pid, -1)
+        tl.atomic_max(overflow_flag_ptr, 1)
+        tl.store(owners_bitmap_ptr + i, 0)
+        return
+
+    slot = tl.load(available_slots_ptr + base + local_idx)
+    old_pid = tl.load(gpu_to_cpu_page_map_ptr + slot)
+    if (old_pid >= 0) & (old_pid < MAX_PAGE_ID):
+        tl.store(cpu_to_gpu_slot_map_ptr + old_pid, -1)
+
+    tl.store(gpu_to_cpu_page_map_ptr + slot, pid)
+    tl.store(cpu_to_gpu_slot_map_ptr + pid, slot)
+    tl.store(owners_bitmap_ptr + i, 1)
 
 
 def copy_pages_to_staging_slots_dedup(
@@ -493,9 +699,16 @@ def copy_pages_to_staging_slots_dedup(
     cpu_v_buffer: torch.Tensor,
     gpu_k_staging: torch.Tensor,
     gpu_v_staging: torch.Tensor,
-    src_page_ids: torch.Tensor,      # [num_pages] - which CPU pages to copy (may have duplicates)
+    src_page_ids: torch.Tensor,
+    cpu_to_gpu_slot_map: torch.Tensor,
+    gpu_to_cpu_page_map: torch.Tensor,
+    available_slots: torch.Tensor,
     page_size: int,
     max_page_id: int,
+    owners_bitmap: torch.Tensor,
+    dst_staging_slots: torch.Tensor,
+    alloc_counter: torch.Tensor,
+    overflow_flag: torch.Tensor,
 ):
     assert cpu_k_buffer.is_pinned() and cpu_v_buffer.is_pinned()
     assert gpu_k_staging.is_cuda and gpu_v_staging.is_cuda
@@ -503,47 +716,91 @@ def copy_pages_to_staging_slots_dedup(
     assert gpu_k_staging.dim() == 3 and gpu_k_staging.shape[1] == 1
 
     num_pages = src_page_ids.shape[0]
-    if num_pages == 0:
-        return torch.empty(0, dtype=torch.int32, device=src_page_ids.device)
-
-    # Allocate mapping: page_id -> staging_slot (-1 = not assigned)
-    staging_slot_map = torch.full((max_page_id,), -1, dtype=torch.int32, device=gpu_k_staging.device)
-
-    # Atomic counter for assigning new staging slots
-    slot_counter = torch.zeros(1, dtype=torch.int32, device=gpu_k_staging.device)
-
-    # Output: staging slot for each input page
-    dst_staging_slots = torch.zeros(num_pages, dtype=torch.int32, device=gpu_k_staging.device)
-
-    # Bitmap: which page_idx should perform the copy (True = first occurrence, False = duplicate)
-    should_copy_bitmap = torch.zeros(num_pages, dtype=torch.bool, device=gpu_k_staging.device)
+    alloc_counter[0] = 0
+    overflow_flag[0] = 0
 
     head_dim = int(cpu_k_buffer.shape[2])
-
-    # Pass 1: Assign staging slots and mark which pages should copy
-    assign_staging_slots_kernel[(num_pages,)](
-        src_page_ids,
-        staging_slot_map,
-        slot_counter,
-        dst_staging_slots,
-        should_copy_bitmap,
-        MAX_PAGE_ID=max_page_id,
-        NUM_PAGES=num_pages,
+    
+    NB = 32
+    num_slots = available_slots.numel()
+    
+    bucket_sizes = torch.full(
+        (NB,), num_slots // NB, device=available_slots.device, dtype=torch.int32
     )
+    remainder = num_slots - int(num_slots // NB) * NB
+    if remainder > 0:
+        bucket_sizes[:remainder] += 1
+    bucket_offsets = torch.empty_like(bucket_sizes)
+    bucket_offsets[0] = 0
+    if NB > 1:
+        bucket_offsets[1:] = torch.cumsum(bucket_sizes, dim=0)[:-1]
 
-    # Pass 2: Copy data only for pages marked should_copy=1
-    grid = (num_pages * page_size,)
-    copy_with_assigned_slots_kernel[grid](
-        cpu_k_buffer,
-        cpu_v_buffer,
-        gpu_k_staging,
-        gpu_v_staging,
+    alloc_counters = torch.zeros((NB,), device=available_slots.device, dtype=torch.int32)
+
+    # Use CUDA events for accurate GPU timing
+    # start_event = torch.cuda.Event(enable_timing=True)
+    # end_event = torch.cuda.Event(enable_timing=True)
+
+    # start_event.record()
+    # Pass A: Mark unique pages and allocate slots
+    mark_and_allocate_unique_kernel_sharded[(num_pages,)](
+        src_page_ids,
+        cpu_to_gpu_slot_map,
+        gpu_to_cpu_page_map,
+        available_slots,
+        alloc_counters,
+        bucket_offsets,
+        bucket_sizes,
+        owners_bitmap,
+        overflow_flag,
+        MAX_PAGE_ID=max_page_id,
+        N=num_pages,
+        NB=NB,
+        num_warps=2,
+    )
+    # end_event.record()
+    # end_event.synchronize()
+    # final = start_event.elapsed_time(end_event)
+    # print(f"[DEBUG] Pass A took {final:.4f} ms")
+    
+    # print("Number of actual copies", alloc_counter)
+    # Check for overflow
+    if overflow_flag[0] == 1:
+        print("Warning: GPU slot overflow detected!")
+
+    # start_event.record()
+    # Pass B: Materialize final slots for all positions
+    materialize_slots_kernel[(num_pages,)](
+        src_page_ids,
+        cpu_to_gpu_slot_map,
+        dst_staging_slots,
+        N=num_pages,
+        MAX_PAGE_ID=max_page_id,
+    )
+    # end_event.record()
+    # end_event.synchronize()
+    # final = start_event.elapsed_time(end_event)
+    # print(f"[DEBUG] Pass B took {final:.4f} ms")
+
+    if torch.any(dst_staging_slots < 0):
+        print("Warning: Some pages failed to allocate staging slots!")
+
+    # start_event.record()
+    # Pass C: Copy only unique pages (owners)
+    copy_with_assigned_slots_kernel[(num_pages * page_size,)](
+        cpu_k_buffer, cpu_v_buffer,
+        gpu_k_staging, gpu_v_staging,
         src_page_ids,
         dst_staging_slots,
-        should_copy_bitmap,
+        owners_bitmap,
         PAGE_SIZE=page_size,
         HEAD_DIM=head_dim,
         NUM_PAGES=num_pages,
     )
+    # end_event.record()
+    # end_event.synchronize()
+    # final = start_event.elapsed_time(end_event)
+    # print(f"[DEBUG] Pass C took {final:.4f} ms")
 
-    return dst_staging_slots
+    # Return only the portion we actually used
+    return dst_staging_slots[:num_pages]
