@@ -73,7 +73,7 @@ class VTXFlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
-
+        self.is_profiling = model_runner.server_args.vortex_profile
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -479,13 +479,14 @@ class VTXFlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
             )
             
-            # o = self.decode_wrappers[1].forward(
-            #     q.contiguous().view(-1, self.num_attn_groups, layer.head_dim),
-            #     (k, v),
-            #     sm_scale=layer.scaling,
-            #     logits_soft_cap=layer.logit_cap,
-            #     k_scale=layer.k_scale,
-            #     v_scale=layer.v_scale,
-            # )
+            if self.is_profiling:
+                o = self.decode_wrappers[1].forward(
+                    q.contiguous().view(-1, self.num_attn_groups, layer.head_dim),
+                    (k, v),
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=layer.logit_cap,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

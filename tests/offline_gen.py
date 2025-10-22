@@ -38,7 +38,7 @@ def main():
 
     sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 4096}
     with open("output.jsonl", "w", encoding="utf-8") as f:
-        for _ in range(8):
+        for _ in range(1):
             o = llm.generate(prompts, sampling_params)
             for item in o:
                     json.dump(item, f, ensure_ascii=False)

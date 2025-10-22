@@ -190,6 +190,7 @@ class ServerArgs:
     vortex_layers_skip: Optional[List[int]] = None
     vortex_page_reserved_bos: int = 1
     vortex_page_reserved_eos: int = 1
+    vortex_profile: bool = False
     
     
     # Optimization/debug options
