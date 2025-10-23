@@ -6,7 +6,7 @@ from transformers import AutoTokenizer
 def main():
     model_name = "Qwen/Qwen3-1.7B"
     llm = sgl.Engine(model_path=model_name, 
-                    disable_cuda_graph=False, 
+                    disable_cuda_graph=True, 
                     page_size=16,
                     vortex_num_selected_pages=30,   
                     disable_overlap_schedule=True,
