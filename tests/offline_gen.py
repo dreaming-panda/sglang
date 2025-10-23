@@ -8,7 +8,7 @@ def main():
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=True, 
                     page_size=16,
-                    vortex_num_selected_pages=32,       
+                    vortex_num_selected_pages=30,       
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
                     enable_vortex_sparsity=True,

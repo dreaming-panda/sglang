@@ -25,7 +25,7 @@ from sglang.srt.utils import (
     debug_timing,
     is_cuda
 )
-from vortex import set_kv_buffer_launcher, update_landmark_launcher
+from vortex import set_kv_buffer_launcher, update_landmark_launcher, FuseUpdateKVLandmark
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -72,6 +72,8 @@ class VTXTokenToKVPool(KVCache):
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
 
+        self.num_pages = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
+        
         self._create_buffers()
 
         self.layer_transfer_counter = None
@@ -85,7 +87,6 @@ class VTXTokenToKVPool(KVCache):
         )
         
         self.mem_usage = (k_size + v_size + landmark_size) / GB
-
         assert self.dtype == torch.bfloat16
         assert self.store_dtype == torch.bfloat16
         
@@ -100,7 +101,7 @@ class VTXTokenToKVPool(KVCache):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.k_buffer = [
                     torch.zeros(
-                        ((self.size + self.page_size) * self.head_num, 1, self.head_dim),
+                        (self.num_pages, self.page_size, 1, self.head_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -108,7 +109,7 @@ class VTXTokenToKVPool(KVCache):
                 ]
                 self.v_buffer = [
                     torch.zeros(
-                        ((self.size + self.page_size) * self.head_num, 1, self.head_dim),
+                        (self.num_pages, self.page_size, 1, self.head_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -117,10 +118,7 @@ class VTXTokenToKVPool(KVCache):
                 
                 self.landmark_buffer = [
                     torch.zeros(
-                        (
-                        ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size, 
-                        1, 
-                        self.head_dim),
+                        (self.num_pages, self.head_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -207,12 +205,39 @@ class VTXTokenToKVPool(KVCache):
         return self.v_buffer[layer_id - self.start_layer]
 
     def get_kv_buffer(self, layer_id: int):
-        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+        return self.k_buffer[layer_id - self.start_layer], self.v_buffer[layer_id - self.start_layer]
 
     def get_landmark_buffer(self, layer_id: int):
         
         return self.landmark_buffer[layer_id - self.start_layer]
     
+    
+    
+    def set_kv_buffer_decode(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        
+        
+        layer_id = layer.layer_id
+        
+        FuseUpdateKVLandmark(
+            cache_k.contiguous(),
+            cache_v.contiguous(),
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            self.landmark_buffer[layer_id - self.start_layer],
+            loc,
+            self.page_size
+        )
+        
+        
     def set_kv_buffer(
         self,
         layer: RadixAttention,

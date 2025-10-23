@@ -6,17 +6,16 @@ from transformers import AutoTokenizer
 def main():
     model_name = "Qwen/Qwen3-1.7B"
     llm = sgl.Engine(model_path=model_name, 
-                    disable_cuda_graph=True, 
-                    disable_radix_cache=False,
+                    disable_cuda_graph=False, 
                     page_size=16,
-                    vortex_num_selected_pages=32,   
+                    vortex_num_selected_pages=30,   
                     disable_overlap_schedule=True,
-                    enable_mixed_chunk=False,
                     attention_backend="flashinfer",
-                    enable_vortex_sparsity=False,
+                    enable_vortex_sparsity=True,
                     vortex_page_reserved_bos=1,
                     vortex_page_reserved_eos=1,
-                    vortex_layers_skip=list(range(1))
+                    vortex_layers_skip=list(range(1)),
+                    vortex_cg=True
                     )
     
     with open("validation.jsonl", "r", encoding="utf-8") as f:
