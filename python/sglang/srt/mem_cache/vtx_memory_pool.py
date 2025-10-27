@@ -37,7 +37,7 @@ In addition to Memory Pool in the original SGLang
 We 
 1) maintain a landmark tensor for every page.
 2) internally treat each KV head as a request (as they may have different sparse patterns), 
-then we interpert external auguments to the physical address
+then we interpret external auguments to the physical address
 """
 
 class VTXTokenToKVPool(KVCache):

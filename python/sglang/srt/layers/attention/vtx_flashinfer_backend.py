@@ -429,7 +429,7 @@ class VTXFlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer_decode(
+                forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
         k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
