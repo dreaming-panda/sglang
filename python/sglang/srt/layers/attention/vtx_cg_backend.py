@@ -213,6 +213,10 @@ class VTXCGAttnBackend(AttentionBackend):
                 num_selected_pages=model_runner.server_args.vortex_num_selected_pages,
                 page_reserved_bos=model_runner.server_args.vortex_page_reserved_bos, 
                 page_reserved_eos=model_runner.server_args.vortex_page_reserved_eos,
+                max_num_pages_per_request=((model_runner.model_config.context_len + model_runner.server_args.page_size - 1) \
+                    // model_runner.server_args.page_size) if model_runner.server_args.vortex_max_seq_lens < 0 \
+                        else ((model_runner.server_args.vortex_max_seq_lens + model_runner.server_args.page_size - 1) \
+                            // model_runner.server_args.page_size),
                 algo_name=model_runner.server_args.vortex_sparse_attention_algorithm
         )
         
