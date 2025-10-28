@@ -14,7 +14,9 @@ def main():
                     enable_vortex_sparsity=True,
                     vortex_page_reserved_bos=1,
                     vortex_page_reserved_eos=1,
-                    vortex_layers_skip=list(range(1))
+                    vortex_layers_skip=list(range(1)),
+                    vortex_cg=True,
+                    vortex_max_seq_lens=8192
                     )
     
     with open('story.txt', "r", encoding="utf-8") as file:

@@ -192,6 +192,7 @@ class ServerArgs:
     vortex_page_reserved_eos: int = 1
     vortex_profile: bool = False
     vortex_cg: bool = False
+    vortex_max_seq_lens: int = -1
 
     
     # Optimization/debug options
@@ -1705,6 +1706,11 @@ class ServerArgs:
             "--vortex-sparse-attention-algorithm",
             type=str,
             default=ServerArgs.vortex_sparse_attention_algorithm,
+        )
+        parser.add_argument(
+            "--vortex-max-seq-lens",
+            type=int,
+            default=ServerArgs.vortex_max_seq_lens,
         )
         
 

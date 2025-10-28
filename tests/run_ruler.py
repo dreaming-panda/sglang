@@ -15,7 +15,8 @@ def main():
                     vortex_page_reserved_bos=1,
                     vortex_page_reserved_eos=1,
                     vortex_layers_skip=list(range(1)),
-                    vortex_cg=True
+                    vortex_cg=True,
+                    vortex_max_seq_lens=8192
                     )
     
     with open("validation.jsonl", "r", encoding="utf-8") as f:
