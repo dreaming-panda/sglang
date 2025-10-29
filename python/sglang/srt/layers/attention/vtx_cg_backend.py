@@ -40,7 +40,7 @@ if is_flashinfer_available():
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
-from vortex import SparseAttentionServer, attention_decode
+from vortex import SparseAttentionServer, attention_decode, broadcast_mv
 
 @dataclass
 class DecodeMetadata:
@@ -198,12 +198,12 @@ class VTXCGAttnBackend(AttentionBackend):
                     use_tensor_cores=self.decode_use_tensor_cores,
                 ),
         ]
-        min_chunk_size = 8
-        max_chunk_size = 32
+        self.min_chunk_size = 8
+        self.max_chunk_size = 32
         max_seq_lengths = model_runner.model_config.context_len
         
         maximum_num_pages =  (max_bs * max_seq_lengths * self.num_kv_heads // self.page_size) + max_bs * self.num_kv_heads
-        maximum_num_workloads = (maximum_num_pages // min_chunk_size) + max_bs * self.num_kv_heads
+        maximum_num_workloads = (maximum_num_pages // self.min_chunk_size) + max_bs * self.num_kv_heads
 
         
         self.winfo_q_indices = torch.zeros(
@@ -225,7 +225,7 @@ class VTXCGAttnBackend(AttentionBackend):
             (maximum_num_pages,), dtype=torch.float32, device=model_runner.device
         )
         
-        
+        self.num_sms = torch.cuda.get_device_properties(0).multi_processor_count
         self.vtx_api = SparseAttentionServer(
                 head_dim=self.head_dim,
                 num_kv_heads=self.num_kv_heads,
@@ -235,8 +235,8 @@ class VTXCGAttnBackend(AttentionBackend):
                 max_seq_lengths=model_runner.model_config.context_len,
                 max_prefill_lengths=model_runner.server_args.max_prefill_tokens,
                 max_num_tokens=model_runner.max_total_num_tokens,
-                min_chunk_size=min_chunk_size,
-                max_chunk_size=max_chunk_size,
+                min_chunk_size=self.min_chunk_size,
+                max_chunk_size=self.max_chunk_size,
                 num_selected_pages=model_runner.server_args.vortex_num_selected_pages,
                 page_reserved_bos=model_runner.server_args.vortex_page_reserved_bos, 
                 page_reserved_eos=model_runner.server_args.vortex_page_reserved_eos,
@@ -603,18 +603,12 @@ class VTXCGAttnBackend(AttentionBackend):
             q = q.view(-1, self.num_attn_groups, layer.head_dim).contiguous()
             landmarks = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
 
-            self.vtx_api.matmul(
-                 query=q,
-                 landmarks=landmarks,
-                 dense_kv_indptr=self.kv_indptr_decode[0],
-                 dense_kv_indices=self.kv_indices_decode[0],
-                 output=self.buffer,
-                 winfo_q_indices=self.winfo_q_indices,
-                 winfo_kv_offsets=self.winfo_kv_offsets,
-                 winfo_kv_lens=self.winfo_kv_lens,
-                 winfo_num_workload=self.winfo_num_workloads,
-                 winfo_chunk_size=self.winfo_chunk_size
-            ) 
+            broadcast_mv(
+                q, landmarks, self.buffer, self.kv_indices_decode[0],
+                self.winfo_q_indices, self.winfo_kv_offsets,
+                self.winfo_kv_lens, self.winfo_num_workloads, 
+                self.max_chunk_size, self.num_attn_groups, self.head_dim, self.num_sms
+            )
             
             self.vtx_api.topk_output(
                  score=self.buffer,
