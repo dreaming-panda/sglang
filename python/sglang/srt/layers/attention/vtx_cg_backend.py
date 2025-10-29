@@ -10,7 +10,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Union, Dict
+from typing import TYPE_CHECKING, Callable, List, Optional, Union, Dict, Tuple
 from functools import partial
 import torch
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
@@ -40,7 +40,7 @@ if is_flashinfer_available():
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
-from vortex import SparseAttentionServer
+from vortex import SparseAttentionServer, attention_decode
 
 @dataclass
 class DecodeMetadata:
@@ -251,7 +251,8 @@ class VTXCGAttnBackend(AttentionBackend):
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata: Dict[int, List[BatchDecodeWithPagedKVCacheWrapper]] = {}
-
+        self.plan_graph: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph]]
+        
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         
         assert not forward_batch.forward_mode.is_draft_extend()
@@ -353,6 +354,15 @@ class VTXCGAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        pass
+    
+    
+    def capture_plan_graph(
+        self, 
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        bs: int):
+        
         pass
 
     def init_forward_metadata_capture_cuda_graph(
@@ -615,6 +625,12 @@ class VTXCGAttnBackend(AttentionBackend):
                  eff_batch_size=q.shape[0]
             )
             
+            # o = attention_decode(
+            #     q, k, v, self.kv_indptr_decode[1], 
+            #     self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
+            #     self.forward_metadata.decode_wrappers[1]._paged_kv_last_page_len_buf,
+            #     self.page_size
+            # )
             o = self.forward_metadata.decode_wrappers[1].forward(
                 q, (k, v),
                 sm_scale=layer.scaling,

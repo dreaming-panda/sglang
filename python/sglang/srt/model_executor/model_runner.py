@@ -1291,11 +1291,11 @@ class ModelRunner:
                     
                     return VTXFlashInferAttnBackend(self)
                 else:
-                    from sglang.srt.layers.attention.vtx_cg_backend import (
-                        VTXCGAttnBackend,
+                    from sglang.srt.layers.attention.vtx_custom_backend import (
+                        VTXAttnBackend,
                     )
                     
-                    return VTXCGAttnBackend(self)
+                    return VTXAttnBackend(self)
             elif not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
