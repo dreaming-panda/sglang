@@ -603,18 +603,12 @@ class VTXCGAttnBackend(AttentionBackend):
             q = q.view(-1, self.num_attn_groups, layer.head_dim).contiguous()
             landmarks = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
 
-            self.vtx_api.matmul(
-                 query=q,
-                 landmarks=landmarks,
-                 dense_kv_indptr=self.kv_indptr_decode[0],
-                 dense_kv_indices=self.kv_indices_decode[0],
-                 output=self.buffer,
-                 winfo_q_indices=self.winfo_q_indices,
-                 winfo_kv_offsets=self.winfo_kv_offsets,
-                 winfo_kv_lens=self.winfo_kv_lens,
-                 winfo_num_workload=self.winfo_num_workloads,
-                 winfo_chunk_size=self.winfo_chunk_size
-            ) 
+            broadcast_mv(
+                q, landmarks, self.buffer, self.kv_indices_decode[0],
+                self.winfo_q_indices, self.winfo_kv_offsets,
+                self.winfo_kv_lens, self.winfo_num_workloads, 
+                self.max_chunk_size, self.num_attn_groups, self.head_dim, self.num_sms
+            )
             
             self.vtx_api.topk_output(
                  score=self.buffer,
