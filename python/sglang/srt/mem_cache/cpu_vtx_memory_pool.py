@@ -9,6 +9,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.utils import debug_timing, is_cuda
 from sglang.srt.mem_cache.cpu_gpu_copy_kernels import (
     copy_sparse_kv_cpu_to_gpu,
+    copy_sparse_kv_cpu_to_gpu_dedup,
     copy_sparse_kv_cpu_to_gpu_tiled,
     store_kv_gpu_to_cpu,
     update_landmark_from_cpu,
@@ -45,7 +46,12 @@ class CPUVTXTokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        layer_skips: Optional[List[int]] = []
+        layer_skips: Optional[List[int]] = [],
+        # For CPU-cached version: GPU buffer sizing
+        vortex_num_selected_pages: Optional[int] = None,
+        vortex_page_reserved_bos: Optional[int] = None,
+        vortex_page_reserved_eos: Optional[int] = None,
+        context_len: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -60,6 +66,12 @@ class CPUVTXTokenToKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_skips = layer_skips
+
+        # Store vortex config for GPU buffer sizing
+        self.vortex_num_selected_pages = vortex_num_selected_pages
+        self.vortex_page_reserved_bos = vortex_page_reserved_bos
+        self.vortex_page_reserved_eos = vortex_page_reserved_eos
+        self.context_len = context_len
 
         self._create_buffers()
         self.device_module = torch.get_device_module(self.device)
@@ -93,7 +105,7 @@ class CPUVTXTokenToKVPool(KVCache):
                 dtype=self.store_dtype,
                 device='cpu',  # CPU storage
                 pin_memory=True,  # Pinned memory for faster GPU transfers
-            )
+            ).contiguous()
             for _ in range(self.layer_num - len(self.layer_skips) if self.layer_skips else self.layer_num)
         ]
         self.v_buffer = [
@@ -102,7 +114,7 @@ class CPUVTXTokenToKVPool(KVCache):
                 dtype=self.store_dtype,
                 device='cpu',  # CPU storage
                 pin_memory=True,  # Pinned memory for faster GPU transfers
-            )
+            ).contiguous()
             for _ in range(self.layer_num - len(self.layer_skips) if self.layer_skips else self.layer_num)
         ]
 
@@ -116,26 +128,37 @@ class CPUVTXTokenToKVPool(KVCache):
                     self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,  # GPU storage
-                )
+                ).contiguous()
                 for _ in range(self.layer_num)
             ]
-            
-            # Staging buffers on GPU: same layout as CPU buffers but on GPU
-            # The size is already calculated by profile_max_num_token to account for staging buffer overhead
+
+            # Staging buffer sizing for CPU-cached version
+            avg_tokens_per_request = self.context_len // 2
+            max_batch_size = self.size // avg_tokens_per_request
+
+            pages_per_request = (self.vortex_num_selected_pages +
+                                self.vortex_page_reserved_bos +
+                                self.vortex_page_reserved_eos)
+            staging_num_tokens = max_batch_size * pages_per_request * self.page_size
+
+            print(f"CPU-cached vortex staging buffer sizing: "
+                  f"max_batch_size={max_batch_size}, "
+                  f"staging_tokens={staging_num_tokens}")
+
             self.k_staging_buffer = [
                 torch.zeros(
-                    ((self.size + self.page_size) * self.head_num, 1, self.head_dim),
+                    ((staging_num_tokens + self.page_size) * self.head_num, 1, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
-                )
+                ).contiguous()
                 for _ in range(self.layer_num)
             ]
             self.v_staging_buffer = [
                 torch.zeros(
-                    ((self.size + self.page_size) * self.head_num, 1, self.head_dim),
+                    ((staging_num_tokens + self.page_size) * self.head_num, 1, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
-                )
+                ).contiguous()
                 for _ in range(self.layer_num)
             ]
 
@@ -213,6 +236,8 @@ class CPUVTXTokenToKVPool(KVCache):
         cpu_k_buffer = self.k_buffer[layer_id - self.start_layer]
         cpu_v_buffer = self.v_buffer[layer_id - self.start_layer]
 
+        # import time
+        # start_time = time.time()
         # Step 1: Store K/V to CPU using Triton kernel
         store_kv_gpu_to_cpu(
             cpu_k_buffer=cpu_k_buffer,
@@ -222,7 +247,13 @@ class CPUVTXTokenToKVPool(KVCache):
             loc=loc,
             page_size=self.page_size,
         )
+        # torch.cuda.synchronize()
+        # end_time = time.time()
+        # final = (end_time - start_time) * 1000.0
+        # print(f"[DEBUG] Storage time {final:.4f} ms")
 
+        # import time
+        # start_time = time.time()
         # Step 2: Update landmarks on GPU
         # Use our custom kernel that loads K pages from CPU and computes landmarks
         update_landmark_from_cpu(
@@ -233,6 +264,10 @@ class CPUVTXTokenToKVPool(KVCache):
             num_kv_head=self.head_num,
             head_dim=self.head_dim,
         )
+        # torch.cuda.synchronize()
+        # end_time = time.time()
+        # final = (end_time - start_time) * 1000.0
+        # print(f"[DEBUG] Update time {final:.4f} ms")
 
     def copy_sparse_kv_to_gpu(
         self,
@@ -246,20 +281,25 @@ class CPUVTXTokenToKVPool(KVCache):
         assert k_staging.is_contiguous()
         assert v_staging.is_contiguous()
 
-        torch.cuda.synchronize()
-        # Use Triton kernel for efficient CPU->GPU sparse copy
+        # Use dedup kernel for efficient CPU->GPU sparse copy
         # sparse_indices already contains per-head page indices from Vortex API
+        # Calculate max_page_id from CPU buffer size
+        cpu_buffer = self.k_buffer[layer_id - self.start_layer]
+        max_page_id = (cpu_buffer.shape[0] // self.head_num) // self.page_size
+
         import time
         start_time = time.time()
-        copy_sparse_kv_cpu_to_gpu(
-            cpu_k_buffer=self.k_buffer[layer_id - self.start_layer],
+        dst_staging_slots = copy_sparse_kv_cpu_to_gpu_dedup(
+            cpu_k_buffer=cpu_buffer,
             cpu_v_buffer=self.v_buffer[layer_id - self.start_layer],
             gpu_k_staging=k_staging,
             gpu_v_staging=v_staging,
-            sparse_indices=sparse_indices,
+            src_page_ids=sparse_indices,
             page_size=self.page_size,
+            max_page_id=max_page_id,
         )
-        
+
+        # if layer_id == self.start_layer:
         torch.cuda.synchronize()
         end_time = time.time()
         final = (end_time - start_time) * 1000.0
@@ -293,7 +333,7 @@ class CPUVTXTokenToKVPool(KVCache):
         #     sparse_indices=sparse_indices,
         #     page_size=self.page_size,
         # )
-        return k_staging, v_staging
+        return k_staging, v_staging, dst_staging_slots
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         raise NotImplementedError("CPU-based KV cache movement not yet implemented")

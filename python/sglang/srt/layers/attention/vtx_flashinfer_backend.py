@@ -434,6 +434,8 @@ class VTXFlashInferAttnBackend(AttentionBackend):
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
         
+        bs = len(forward_batch.req_pool_indices)
+        # print(bs)
         use_sparsity = (self.forward_metadata.use_sparsity) and (layer.layer_id not in self.layers_skip)
         
         if k is not None:
@@ -451,8 +453,8 @@ class VTXFlashInferAttnBackend(AttentionBackend):
             q_compress = q.contiguous().view(-1, self.num_attn_groups, layer.head_dim).sum(dim=-2)
             landmarks = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
 
-            if layer.layer_id == 1:
-                print("first", self.kv_indices[0][:self.kv_indptr[0][1].item() - self.kv_indptr[0][0].item()])
+            # if layer.layer_id == 1:
+            #     print("first", self.kv_indices[0][:self.kv_indptr[0][1].item() - self.kv_indptr[0][0].item()])
 
             self.vtx_api.get_sparse_kv_indices(
                 query=q_compress,
@@ -463,8 +465,8 @@ class VTXFlashInferAttnBackend(AttentionBackend):
                 sparse_kv_indices=self.kv_indices[0]
             )
             #torch.cuda.synchronize()
-            if layer.layer_id == 1:
-                print("second", self.kv_indices[0][:self.kv_indptr[0][1].item() - self.kv_indptr[0][0].item()])
+            # if layer.layer_id == 1:
+            #     print("second", self.kv_indices[0][:self.kv_indptr[0][1].item() - self.kv_indptr[0][0].item()])
             
             self.decode_wrappers[0]._paged_kv_indices_buf = self.kv_indices[0]
             o = self.decode_wrappers[0].forward(

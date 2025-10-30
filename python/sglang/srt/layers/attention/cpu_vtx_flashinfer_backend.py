@@ -584,6 +584,7 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
 
         cache_loc = forward_batch.out_cache_loc
         bs = len(forward_batch.req_pool_indices)
+        # print(bs)
         use_sparsity = (self.forward_metadata.use_sparsity) and (layer.layer_id not in self.layers_skip)
 
         # Save new K/V to CPU cache

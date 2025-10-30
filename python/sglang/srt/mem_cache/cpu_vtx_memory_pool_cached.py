@@ -6,6 +6,7 @@ from sglang.srt.mem_cache.cpu_vtx_memory_pool import CPUVTXTokenToKVPool
 from sglang.srt.mem_cache.cpu_gpu_copy_kernels import (
     copy_pages_to_staging_slots_dedup,
     copy_pages_to_staging_slots_dedup_lru,
+    copy_pages_to_staging_slots_simple_lru,
     store_kv_cpu_and_gpu,
     update_landmark_from_cpu
 )
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
-    def __init__(self, *args, eviction_policy="lru", **kwargs):
+    def __init__(self, *args, eviction_policy="random", **kwargs):
         super().__init__(*args, **kwargs)
 
         # Eviction policy: "random" or "lru"
@@ -61,47 +62,47 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
             # CPU→GPU slot mapping: cpu_page_id → gpu_staging_slot (-1 if not cached)
             cpu_to_gpu_map = torch.full(
                 (max_page_id,), -1, dtype=torch.int32, device=self.device
-            )
+            ).contiguous()
             self.cpu_to_gpu_slot_maps.append(cpu_to_gpu_map)
 
             # GPU→CPU page mapping: gpu_staging_slot → cpu_page_id (-1 if empty)
             gpu_to_cpu_map = torch.full(
                 (staging_buffer_capacity,), -1, dtype=torch.int32, device=self.device
-            )
+            ).contiguous()
             self.gpu_to_cpu_page_maps.append(gpu_to_cpu_map)
 
             # Slot counter: tracks how many slots have been allocated
-            slot_counter = torch.zeros(1, dtype=torch.int32, device=self.device)
+            slot_counter = torch.zeros(1, dtype=torch.int32, device=self.device).contiguous()
             self.slot_counters.append(slot_counter)
 
             # LRU-specific pre-allocated buffers (only if using LRU policy)
             if self.eviction_policy == "lru":
                 # Ages: 0=empty, 1=oldest, 32=newest
-                slot_ages = torch.zeros(staging_buffer_capacity, dtype=torch.int32, device=self.device)
+                slot_ages = torch.zeros(staging_buffer_capacity, dtype=torch.int32, device=self.device).contiguous()
                 self.slot_ages.append(slot_ages)
 
                 # Warp start indices (constant)
                 warp_start_indices = torch.arange(0, num_warps * WARP_SIZE, WARP_SIZE,
-                                                  dtype=torch.int32, device=self.device)
+                                                  dtype=torch.int32, device=self.device).contiguous()
                 self.warp_start_indices_list.append(warp_start_indices)
 
                 # Warp empty counts (reusable buffer)
-                warp_empty_counts = torch.zeros(num_warps, dtype=torch.int32, device=self.device)
+                warp_empty_counts = torch.zeros(num_warps, dtype=torch.int32, device=self.device).contiguous()
                 self.warp_empty_counts_list.append(warp_empty_counts)
 
                 # LRU bucket sizes (constant) - each bucket = 32 slots (one warp)
-                lru_bucket_sizes = torch.full((num_warps,), WARP_SIZE, device=self.device, dtype=torch.int32)
+                lru_bucket_sizes = torch.full((num_warps,), WARP_SIZE, device=self.device, dtype=torch.int32).contiguous()
                 if staging_buffer_capacity % WARP_SIZE != 0:
                     lru_bucket_sizes[-1] = staging_buffer_capacity % WARP_SIZE
                 self.lru_bucket_sizes_list.append(lru_bucket_sizes)
 
                 # LRU bucket offsets (constant)
                 lru_bucket_offsets = torch.arange(0, num_warps * WARP_SIZE, WARP_SIZE,
-                                                  dtype=torch.int32, device=self.device)
+                                                  dtype=torch.int32, device=self.device).contiguous()
                 self.lru_bucket_offsets_list.append(lru_bucket_offsets)
 
                 # LRU alloc counters (reusable buffer, needs reset each iteration)
-                lru_alloc_counters = torch.zeros(num_warps, dtype=torch.int32, device=self.device)
+                lru_alloc_counters = torch.zeros(num_warps, dtype=torch.int32, device=self.device).contiguous()
                 self.lru_alloc_counters_list.append(lru_alloc_counters)
             else:
                 # Random eviction bucket setup (NB=32 fixed buckets)
@@ -128,16 +129,16 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
 
             # Pre-allocate temp buffers sized to max capacity (eliminates allocation on hot path)
             self.temp_owners_bitmaps.append(
-                torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device)
+                torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
             )
             self.temp_staging_slots.append(
-                torch.zeros(staging_buffer_capacity, dtype=torch.int32, device=self.device)
+                torch.zeros(staging_buffer_capacity, dtype=torch.int32, device=self.device).contiguous()
             )
             self.temp_alloc_counters.append(
-                torch.zeros(1, dtype=torch.int32, device=self.device)
+                torch.zeros(1, dtype=torch.int32, device=self.device).contiguous()
             )
             self.temp_overflow_flags.append(
-                torch.zeros(1, dtype=torch.int32, device=self.device)
+                torch.zeros(1, dtype=torch.int32, device=self.device).contiguous()
             )
 
         self.max_page_id = max_page_id
@@ -168,7 +169,7 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
         gpu_slots_valid = gpu_slots[gpu_slots >= 0]  # Filter out -1 (cache misses)
 
         # Create bitmap: mark slots that are in use by current request
-        temp = torch.zeros(self.staging_buffer_capacity, dtype=torch.bool, device=self.device)
+        temp = torch.zeros(self.staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
         if gpu_slots_valid.numel() > 0:
             temp[gpu_slots_valid] = True
 
@@ -179,11 +180,11 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
 
         # torch.cuda.synchronize()
         # Copy with persistent bidirectional mapping and available slots
-        # import time
-        # start_time = time.time()
+        import time
+        start_time = time.time()
 
         if self.eviction_policy == "lru":
-            # Use LRU eviction policy with pre-allocated buffers
+            # Use LRU eviction policy with dedup and pre-allocated buffers
             staging_slots_all = copy_pages_to_staging_slots_dedup_lru(
                 cpu_k_buffer=self.k_buffer[layer_idx],
                 cpu_v_buffer=self.v_buffer[layer_idx],
@@ -200,7 +201,6 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
                 dst_staging_slots=self.temp_staging_slots[layer_idx],
                 alloc_counter=self.temp_alloc_counters[layer_idx],
                 overflow_flag=self.temp_overflow_flags[layer_idx],
-                # Pre-allocated LRU buffers
                 warp_start_indices=self.warp_start_indices_list[layer_idx],
                 warp_empty_counts=self.warp_empty_counts_list[layer_idx],
                 bucket_sizes=self.lru_bucket_sizes_list[layer_idx],
@@ -232,10 +232,10 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
                 nb=self.nb_random,
             )
 
-        # torch.cuda.synchronize()
-        # end_time = time.time()
-        # final = (end_time - start_time) * 1000.0
-        # print(f"[DEBUG] CPU->GPU sparse KV staging copy with persistent cache took {final:.4f} ms")
+        torch.cuda.synchronize()
+        end_time = time.time()
+        final = (end_time - start_time) * 1000.0
+        print(f"[DEBUG] CPU->GPU sparse KV staging copy with persistent cache took {final:.4f} ms")
         
         return k_staging, v_staging, staging_slots_all
 
@@ -261,8 +261,8 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
         # Store to CPU and update GPU staging buffer if page is cached
         # torch.cuda.synchronize()
         # # Copy with persistent bidirectional mapping and available slots
-        # import time
-        # start_time = time.time()
+        import time
+        start_time = time.time()
         store_kv_cpu_and_gpu(
             cpu_k_buffer,
             cpu_v_buffer,
@@ -275,11 +275,13 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
             cpu_to_gpu_map,
             self.max_page_id,
         )
-        # torch.cuda.synchronize()
-        # end_time = time.time()
-        # final = (end_time - start_time) * 1000.0
-        # print(f"[DEBUG] Storage time {final:.4f} ms")
+        torch.cuda.synchronize()
+        end_time = time.time()
+        final = (end_time - start_time) * 1000.0
+        print(f"[DEBUG] Storage time {final:.4f} ms")
         
+        import time
+        start_time = time.time()
         update_landmark_from_cpu(
             cpu_k_buffer=cpu_k_buffer,
             gpu_landmark=self.landmark_buffer[layer_id - self.start_layer],
@@ -288,3 +290,7 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
             num_kv_head=self.head_num,
             head_dim=self.head_dim,
         )
+        torch.cuda.synchronize()
+        end_time = time.time()
+        final = (end_time - start_time) * 1000.0
+        print(f"[DEBUG] Update time {final:.4f} ms")

@@ -119,6 +119,7 @@ class TpModelWorker:
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
+
         self.max_running_requests = min(
             (
                 self.max_total_num_tokens // 2

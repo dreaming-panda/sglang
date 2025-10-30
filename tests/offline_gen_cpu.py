@@ -27,7 +27,7 @@ def main():
         # Vortex sparse attention settings
         attention_backend="cpu_vtx_flashinfer",  # Use CPU-based backend
         enable_vortex_sparsity=True,
-        vortex_num_selected_pages=128,
+        vortex_num_selected_pages=30,
         vortex_page_reserved_bos=1,
         vortex_page_reserved_eos=1,
         vortex_layers_skip=[],  # Skip first layer for Vortex

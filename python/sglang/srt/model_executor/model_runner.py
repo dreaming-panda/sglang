@@ -952,6 +952,70 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         elif self.server_args.enable_vortex_sparsity:
+            # For vortex: calculate based on GPU staging buffer + landmark buffer
+            num_kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+
+            # For CPU-cached vortex: GPU only needs staging buffer + landmark
+            if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
+                # GPU staging buffer: stores sparse selected pages
+                # Each request selects (num_selected + reserved) pages per head
+                pages_per_request = (
+                    self.server_args.vortex_num_selected_pages +
+                    self.server_args.vortex_page_reserved_bos +
+                    self.server_args.vortex_page_reserved_eos
+                )
+                # GPU staging buffer size per request (across all heads and layers)
+                staging_size_per_request = (
+                    pages_per_request
+                    * self.server_args.page_size
+                    * num_kv_heads
+                    * self.model_config.head_dim
+                    * num_layers
+                    * 2  # K + V
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+                # Landmark buffer: stores landmarks for full context
+                # Assuming average request uses context_len / 2 tokens
+                avg_tokens_per_request = self.model_config.context_len // 2
+                landmark_size_per_request = (
+                    (avg_tokens_per_request + self.server_args.page_size - 1) // self.server_args.page_size
+                    * num_kv_heads
+                    * self.model_config.head_dim
+                    * num_layers
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+                total_size_per_request = staging_size_per_request + landmark_size_per_request
+
+                rest_memory = available_gpu_memory - total_gpu_memory * (
+                    1 - self.mem_fraction_static
+                )
+                max_batch_size_from_memory = int(rest_memory * (1 << 30) // total_size_per_request)
+
+                # Vortex is bounded by 256 max batch size
+                max_batch_size = min(max_batch_size_from_memory, 30)
+
+                # CPU buffer size: avg tokens per request * max batch size
+                max_num_token = max_batch_size * avg_tokens_per_request
+
+                print(
+                    f"CPU-cached vortex profiling: "
+                    f"max_batch_size={max_batch_size} (from_memory={max_batch_size_from_memory}), "
+                    f"avg_tokens_per_request={avg_tokens_per_request}, "
+                    f"staging_size_per_request={staging_size_per_request / (1<<20):.2f} MB, "
+                    f"landmark_size_per_request={landmark_size_per_request / (1<<20):.2f} MB, "
+                    f"max_num_token={max_num_token}"
+                )
+                return max_num_token
+            else:
+                # Standard vortex: GPU stores full KV cache + landmark buffer
+                cell_size = (
+                    num_kv_heads
+                    * self.model_config.head_dim
+                    * num_layers
+                    * (2 + 1 / self.server_args.page_size)
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+        else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
                 * self.model_config.head_dim
@@ -1024,11 +1088,15 @@ class ModelRunner:
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
-        if max_num_reqs is None:
+        if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
+            max_num_reqs = min(self.max_total_num_tokens // (self.model_config.context_len // 2), 256)
+        else:
             max_num_reqs = min(
                 max(
                     int(
-                        self.max_total_num_tokens / self.model_config.context_len * 512
+                        self.max_total_num_tokens
+                        / self.model_config.context_len
+                        * 512
                     ),
                     2048,
                 ),
@@ -1201,7 +1269,11 @@ class ModelRunner:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
-                        layer_skips=self.server_args.vortex_layers_skip
+                        layer_skips=self.server_args.vortex_layers_skip,
+                        vortex_num_selected_pages=self.server_args.vortex_num_selected_pages,
+                        vortex_page_reserved_bos=self.server_args.vortex_page_reserved_bos,
+                        vortex_page_reserved_eos=self.server_args.vortex_page_reserved_eos,
+                        context_len=self.model_config.context_len,
                     )
                 else:
                     self.token_to_kv_pool = CPUVTXTokenToKVPool(
@@ -1217,7 +1289,11 @@ class ModelRunner:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
-                        layer_skips=self.server_args.vortex_layers_skip
+                        layer_skips=self.server_args.vortex_layers_skip,
+                        vortex_num_selected_pages=self.server_args.vortex_num_selected_pages,
+                        vortex_page_reserved_bos=self.server_args.vortex_page_reserved_bos,
+                        vortex_page_reserved_eos=self.server_args.vortex_page_reserved_eos,
+                        context_len=self.model_config.context_len,
                     )
             elif self.server_args.enable_vortex_sparsity:
                 self.token_to_kv_pool = VTXTokenToKVPool(
