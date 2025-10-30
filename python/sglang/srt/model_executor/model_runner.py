@@ -1039,7 +1039,7 @@ class ModelRunner:
                     ),
                     2048,
                 ),
-                4096 if not self.server_args.enable_vortex_sparsity else 256,
+                4096 if not self.server_args.enable_vortex_sparsity else 1024,
             )
             
         if SGLANG_CI_SMALL_KV_SIZE:

@@ -619,12 +619,6 @@ class VTXCGAttnBackend(AttentionBackend):
                  eff_batch_size=q.shape[0]
             )
             
-            # o = attention_decode(
-            #     q, k, v, self.kv_indptr_decode[1], 
-            #     self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
-            #     self.forward_metadata.decode_wrappers[1]._paged_kv_last_page_len_buf,
-            #     self.page_size
-            # )
             o = self.forward_metadata.decode_wrappers[1].forward(
                 q, (k, v),
                 sm_scale=layer.scaling,
