@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
-    def __init__(self, *args, eviction_policy="random", **kwargs):
+    def __init__(self, *args, eviction_policy="lru", **kwargs):
         super().__init__(*args, **kwargs)
 
         # Eviction policy: "random" or "lru"

@@ -47,7 +47,7 @@ def generate_requests(dataset: Dataset, field_name: str, data_format: str, trial
 
 
 def main():
-    model_name = "Qwen/Qwen3-1.7B"
+    model_name = "Qwen/Qwen3-14B"
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=True,
                     page_size=16,
@@ -82,7 +82,7 @@ def main():
     ) for text in texts
     ] * 8
     
-    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 16384}
+    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 2048}
     total_tokens = 0
     total_time = 0.0
     start = time.perf_counter()

@@ -140,6 +140,7 @@ class CPUVTXTokenToKVPool(KVCache):
                                 self.vortex_page_reserved_bos +
                                 self.vortex_page_reserved_eos)
             staging_num_tokens = max_batch_size * pages_per_request * self.page_size
+            BUFFER_SIZE = 4096
 
             print(f"CPU-cached vortex staging buffer sizing: "
                   f"max_batch_size={max_batch_size}, "
@@ -147,7 +148,7 @@ class CPUVTXTokenToKVPool(KVCache):
 
             self.k_staging_buffer = [
                 torch.zeros(
-                    ((staging_num_tokens + self.page_size) * self.head_num, 1, self.head_dim),
+                    ((staging_num_tokens + self.page_size + BUFFER_SIZE) * self.head_num, 1, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 ).contiguous()
@@ -155,7 +156,7 @@ class CPUVTXTokenToKVPool(KVCache):
             ]
             self.v_staging_buffer = [
                 torch.zeros(
-                    ((staging_num_tokens + self.page_size) * self.head_num, 1, self.head_dim),
+                    ((staging_num_tokens + self.page_size + BUFFER_SIZE) * self.head_num, 1, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 ).contiguous()

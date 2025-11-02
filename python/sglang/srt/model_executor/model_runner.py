@@ -992,7 +992,7 @@ class ModelRunner:
                 max_batch_size_from_memory = int(rest_memory * (1 << 30) // total_size_per_request)
 
                 # Vortex is bounded by 256 max batch size
-                max_batch_size = min(max_batch_size_from_memory, 30)
+                max_batch_size = min(max_batch_size_from_memory, 256)
 
                 # CPU buffer size: avg tokens per request * max batch size
                 max_num_token = max_batch_size * avg_tokens_per_request

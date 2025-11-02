@@ -843,14 +843,14 @@ def mark_and_allocate_unique_kernel_lru_sharded(
 
     # Select bucket based on thread index with hash for better distribution
     # Use simple hash to avoid collision patterns (int32-safe constants)
-    # slot_idx = i % NUM_AVAILABLE
-    # h = slot_idx
-    # h = (h ^ (h >> 16)) & 0x7fffffff
-    # h = (h * 73856093) & 0x7fffffff
-    # h = (h ^ (h >> 13)) & 0x7fffffff
-    # h = (h * 19349663) & 0x7fffffff
-    # h = (h ^ (h >> 16)) & 0x7fffffff
-    bucket = pid % NB
+    slot_idx = i % NUM_AVAILABLE
+    h = slot_idx
+    h = (h ^ (h >> 16)) & 0x7fffffff
+    h = (h * 73856093) & 0x7fffffff
+    h = (h ^ (h >> 13)) & 0x7fffffff
+    h = (h * 19349663) & 0x7fffffff
+    h = (h ^ (h >> 16)) & 0x7fffffff
+    bucket = h % NB
     base = tl.load(bucket_offsets_ptr + bucket)
     size = tl.load(bucket_sizes_ptr + bucket)
 
@@ -1279,14 +1279,14 @@ def copy_pages_to_staging_slots_dedup_lru(
     head_dim = int(cpu_k_buffer.shape[2])
 
     # Use CUDA events for accurate GPU timing
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    # start_event = torch.cuda.Event(enable_timing=True)
+    # end_event = torch.cuda.Event(enable_timing=True)
 
-    start_event.record()
+    # start_event.record()
     # Step 1: Sort slots within each warp by age using CUDA kernel
     # Note: warp_empty_counts is reused, no need to zero it (kernel overwrites)
     # Compute actual number of warps based on available_slots size (changes each iteration)
-    num_available_slots = available_slots.shape[0]
+    num_available_slots = (available_slots.shape[0] // 32) * 32
     actual_num_warps = num_available_slots // 32
 
     # Use subset of pre-allocated warp_start_indices for actual warps
@@ -1300,10 +1300,10 @@ def copy_pages_to_staging_slots_dedup_lru(
         actual_warp_empty_counts
     )
 
-    end_event.record()
-    end_event.synchronize()
-    final = start_event.elapsed_time(end_event)
-    print(f"[DEBUG] Pass A (LRU sort) took {final:.4f} ms")
+    # end_event.record()
+    # end_event.synchronize()
+    # final = start_event.elapsed_time(end_event)
+    # print(f"[DEBUG] Pass A (LRU sort) took {final:.4f} ms")
 
     # start_event.record()
     # Step 2: Calculate cache misses BEFORE allocation
@@ -1329,10 +1329,14 @@ def copy_pages_to_staging_slots_dedup_lru(
     # Reset alloc counters for actual warps
     actual_alloc_counters = alloc_counters[:actual_num_warps]
     actual_alloc_counters.zero_()
+    
+    # cache_misses = (cpu_to_gpu_slot_map[torch.unique(src_page_ids)] == -1).sum().item()
+    # cache_hits = (cpu_to_gpu_slot_map[torch.unique(src_page_ids)] >= 0).sum().item()
+    # print(f"[DEBUG] Allocating {cache_misses} pages from {num_available_slots} available slots, cache hits={cache_hits}, total pages={num_pages}")
 
-    start_event.record()
+    # start_event.record()
     # Step 4: Allocate using sharded kernel with LRU
-    mark_and_allocate_unique_kernel_lru_sharded[(num_pages,)](
+    vortex_C.mark_and_allocate_unique_lru_sharded(
         src_page_ids,
         cpu_to_gpu_slot_map,
         gpu_to_cpu_page_map,
@@ -1348,19 +1352,19 @@ def copy_pages_to_staging_slots_dedup_lru(
         NB=actual_num_warps,
         NUM_AVAILABLE=num_available_slots,
     )
-    end_event.record()
-    end_event.synchronize()
-    final = start_event.elapsed_time(end_event)
+    # end_event.record()
+    # end_event.synchronize()
+    # final = start_event.elapsed_time(end_event)
 
     # # num_allocated = actual_alloc_counters.sum().item()
-    print(f"[DEBUG] Pass B (allocate) took {final:.4f} ms")
+    # print(f"[DEBUG] Pass B (allocate) took {final:.4f} ms")
     # print(f"[DEBUG] Pages: total={num_pages}, unique={num_unique_pages}, cache_misses={num_cache_misses}, allocated={num_allocated}")
 
     # if num_allocated != num_cache_misses:
     #     print(f"[WARNING] Allocation mismatch! Expected {num_cache_misses} but got {num_allocated}")
     
     # print(f"[DEBUG] alloc_counters per bucket: {actual_alloc_counters.tolist()}")
-
+    # print(f"[DEBUG] Allocated {actual_alloc_counters.sum().item()} pages")
     # Check for overflow
     if overflow_flag[0] == 1:
         print("Warning: GPU slot overflow detected!")
@@ -1370,44 +1374,51 @@ def copy_pages_to_staging_slots_dedup_lru(
         if len(overflow_buckets) > 0:
             print(f"[DEBUG OVERFLOW] Overflowed buckets: {overflow_buckets.tolist()}")
 
-    start_event.record()
+    # start_event.record()
     # Step 4: Materialize final slots for all positions
-    materialize_slots_kernel[(num_pages,)](
+    vortex_C.materialize_slots(
         src_page_ids,
         cpu_to_gpu_slot_map,
         dst_staging_slots,
         N=num_pages,
         MAX_PAGE_ID=max_page_id,
     )
-    end_event.record()
-    end_event.synchronize()
-    final = start_event.elapsed_time(end_event)
-    print(f"[DEBUG] Pass C took {final:.4f} ms")
+    # end_event.record()
+    # end_event.synchronize()
+    # final = start_event.elapsed_time(end_event)
+    # print(f"[DEBUG] Pass C took {final:.4f} ms")
 
     if torch.any(dst_staging_slots < 0):
         print("Warning: Some pages failed to allocate staging slots!")
 
-    start_event.record()
+    # start_event.record()
     # Step 5: Copy only unique pages (owners)
-    copy_with_assigned_slots_kernel[(num_pages * page_size,)](
+    vortex_C.copy_with_assigned_slots(
         cpu_k_buffer, cpu_v_buffer,
         gpu_k_staging, gpu_v_staging,
         src_page_ids,
         dst_staging_slots,
         owners_bitmap,
-        PAGE_SIZE=page_size,
-        HEAD_DIM=head_dim,
-        NUM_PAGES=num_pages,
+        page_size=page_size,
+        head_dim=head_dim,
+        num_pages=num_pages,
     )
-    end_event.record()
-    end_event.synchronize()
-    final = start_event.elapsed_time(end_event)
-    print(f"[DEBUG] Pass D took {final:.4f} ms")
+    # end_event.record()
+    # end_event.synchronize()
+    # final = start_event.elapsed_time(end_event)
+    # print(f"[DEBUG] Pass D took {final:.4f} ms")
 
     # Step 6: Age decay for next iteration (matching OneFlow LRU)
     # Decrement all non-zero ages to simulate aging
     # Ages: 0=empty, 1=oldest, 32=newest
-    non_zero_mask = slot_ages > 0
-    slot_ages[non_zero_mask] = torch.clamp(slot_ages[non_zero_mask] - 1, min=1, max=32)
+    # start_event.record()
+    vortex_C.decrement_slot_ages(
+        slot_ages,
+        slot_ages.shape[0]
+    )
+    # end_event.record()
+    # end_event.synchronize()
+    # final = start_event.elapsed_time(end_event)
+    # print(f"[DEBUG] Pass E took {final:.4f} ms")
 
     return dst_staging_slots[:num_pages]
