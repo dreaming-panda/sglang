@@ -90,6 +90,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 
 from sglang.srt.mem_cache.vtx_memory_pool import VTXTokenToKVPool
+from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
@@ -243,6 +244,13 @@ class ModelRunner:
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
 
+        self.sparse_attention = None
+        if self.server_args.enable_vortex_sparsity:
+            import vortex_torch
+            self.sparse_attention = vortex_torch.flow.build_vflow(
+                self.server_args.vortex_module_name,
+                user_file=self.server_args.vortex_module_path
+            )
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -951,13 +959,23 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         elif self.server_args.enable_vortex_sparsity:
-            cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
-                * num_layers
-                * (2 + 1.0 / self.page_size)
-                * torch._utils._element_size(self.kv_cache_dtype)
-            )
+            
+            if self.server_args.vortex_graph:
+                cell_size = (
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * self.model_config.head_dim
+                    * num_layers
+                    * self.sparse_attention.get_token_ratio(self.page_size, self.model_config.head_dim)
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+            else:
+                cell_size = (
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * self.model_config.head_dim
+                    * num_layers
+                    * (2 + 1.0 / self.page_size)
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -1192,20 +1210,41 @@ class ModelRunner:
                     device=self.device,
                 )
             elif self.server_args.enable_vortex_sparsity:
-                self.token_to_kv_pool = VTXTokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                )
+                
+                if self.server_args.vortex_graph:
+                    
+                    self.token_to_kv_pool = VTXGraphCachePool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        sparse_attention=self.sparse_attention,
+                        model_runner=self,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
+                
+                else:
+                    self.token_to_kv_pool = VTXTokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
@@ -1284,18 +1323,26 @@ class ModelRunner:
     def _get_attention_backend(self):
         if self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
-                if not self.server_args.vortex_cg:
+                
+                if self.server_args.vortex_graph:
+                    from sglang.srt.layers.attention.vtx_graph_backend import (
+                        VTXGraphAttnBackend,
+                    )
+                    
+                    return VTXGraphAttnBackend(self)
+                
+                elif not self.server_args.vortex_cg:
                     from sglang.srt.layers.attention.vtx_flashinfer_backend import (
                         VTXFlashInferAttnBackend,
                     )
                     
                     return VTXFlashInferAttnBackend(self)
                 else:
-                    from sglang.srt.layers.attention.vtx_custom_backend import (
-                        VTXAttnBackend,
+                    from sglang.srt.layers.attention.vtx_cg_backend import (
+                        VTXCGAttnBackend,
                     )
                     
-                    return VTXAttnBackend(self)
+                    return VTXCGAttnBackend(self)
             elif not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,

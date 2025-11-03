@@ -185,15 +185,21 @@ class ServerArgs:
     
     # Vortex Sparse Attention
     enable_vortex_sparsity: bool = False
-    vortex_sparse_attention_algorithm: str = 'BLOCK_TOPK'
     vortex_num_selected_pages: int = 30
+    vortex_topk_val: int = 30
     vortex_layers_skip: Optional[List[int]] = None
     vortex_page_reserved_bos: int = 1
     vortex_page_reserved_eos: int = 1
     vortex_profile: bool = False
     vortex_cg: bool = False
+    vortex_graph: bool = False
     vortex_max_seq_lens: int = -1
-
+    vortex_lb_max_chunk_size: int = 32
+    vortex_lb_min_chunk_size: int = 8
+    vortex_indexer_dtype: str = "float32"
+    vortex_module_path: str = None
+    vortex_module_name: str = None
+    
     
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -1688,6 +1694,11 @@ class ServerArgs:
             default=ServerArgs.vortex_num_selected_pages,
         )
         parser.add_argument(
+            "--vortex-topk-val",
+            type=int,
+            default=ServerArgs.vortex_topk_val,
+        )
+        parser.add_argument(
             "--vortex-page-reserved-bos",
             type=int,
             default=ServerArgs.vortex_page_reserved_bos,
@@ -1703,15 +1714,37 @@ class ServerArgs:
             nargs="+",
         )
         parser.add_argument(
-            "--vortex-sparse-attention-algorithm",
-            type=str,
-            default=ServerArgs.vortex_sparse_attention_algorithm,
-        )
-        parser.add_argument(
             "--vortex-max-seq-lens",
             type=int,
             default=ServerArgs.vortex_max_seq_lens,
         )
+        parser.add_argument(
+            "--vortex-lb-max-chunk-size",
+            type=int,
+            default=ServerArgs.vortex_lb_max_chunk_size,
+        )
+        parser.add_argument(
+            "--vortex-lb-min-chunk-size",
+            type=int,
+            default=ServerArgs.vortex_lb_min_chunk_size,
+        )
+        parser.add_argument(
+            "--vortex-indexer-dtype",
+            type=str,
+            choices=["float32"],
+            default=ServerArgs.vortex_indexer_dtype,
+        )
+        parser.add_argument(
+            "--vortex-module-path",
+            type=str,
+            default=ServerArgs.vortex_module_path,
+        )
+        parser.add_argument(
+            "--vortex-module-name",
+            type=str,
+            default=ServerArgs.vortex_module_name,
+        )
+        
         
 
     @classmethod

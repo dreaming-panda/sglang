@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import numpy as np
 import torch
@@ -25,7 +25,9 @@ from sglang.srt.utils import (
     debug_timing,
     is_cuda
 )
-from vortex import set_kv_buffer_launcher, update_landmark_launcher, FuseUpdateKVLandmark
+
+import vortex_torch
+from vortex_torch import as_vtensor, FORMAT
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -35,12 +37,12 @@ Sparse Attention Memory pool.
 
 In addition to Memory Pool in the original SGLang
 We 
-1) maintain a landmark tensor for every page.
+1) maintain auxilary cache tensor objects for every page.
 2) internally treat each KV head as a request (as they may have different sparse patterns), 
 then we interpret external auguments to the physical address
 """
 
-class VTXTokenToKVPool(KVCache):
+class VTXGraphCachePool(KVCache):
 
     def __init__(
         self,
@@ -52,6 +54,8 @@ class VTXTokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        sparse_attention: vortex_torch.flow.vFlow,
+        model_runner,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -74,94 +78,106 @@ class VTXTokenToKVPool(KVCache):
 
         self.num_pages = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
         
+        self.sparse_attention = sparse_attention
+        self.ctx = vortex_torch.cache.Context()
+        
         self._create_buffers()
-
+        self._initialize_graph(model_runner)
         self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
 
-        k_size, v_size = self.get_kv_size_bytes()
-        landmark_size = self.get_landmark_size_bytes()
+        cache_size = self.get_cache_size_bytes()
+        
         logger.info(
-            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB, Landmark size: {landmark_size / GB:.2f} GB."
+            f"KV Cache is allocated. #tokens: {size}, Cache size: {cache_size / GB:.2f} GB"
         )
         
-        self.mem_usage = (k_size + v_size + landmark_size) / GB
+        self.mem_usage = cache_size / GB
         assert self.dtype == torch.bfloat16
         assert self.store_dtype == torch.bfloat16
+    
+    def _initialize_graph(self, model_runner) -> None:
         
+        self.ctx.create(self, model_runner)
+        self.ctx.profile()
+        
+        try:
+            with torch.no_grad():
+                loc_dummy = torch.empty((0,), dtype=torch.int64, device=self.device)
+                cache_dummy = {
+                        cache_name:  as_vtensor(torch.zeros(
+                                (0, cache_shape[0], cache_shape[1]),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            ), FORMAT.PAGED)
+                        
+                        for (cache_name, cache_shape) in self.cache_meta_info.items()
+                }
+                self.sparse_attention.forward_cache(cache=cache_dummy, loc=loc_dummy, ctx=self.ctx)      
+        except Exception:
+            raise
+        
+        self.ctx.summary()
+        self.ctx.execute()
+
+
     def _create_buffers(self):
+        
+        self.cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
                 else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.num_pages, self.page_size, 1, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
+            ):  
+                self.cache = [
+                    {
+                        cache_name:  torch.zeros(
+                                (self.num_pages, cache_shape[0], cache_shape[1]),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                        
+                        for (cache_name, cache_shape) in self.cache_meta_info.items()
+                    }
+                    
                     for _ in range(self.layer_num)
                 ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.num_pages, self.page_size, 1, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                
-                self.landmark_buffer = [
-                    torch.zeros(
-                        (self.num_pages, 1,  1, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_buffer + self.v_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.data_strides = torch.tensor(
-            [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
-                for x in self.k_buffer + self.v_buffer
-            ],
-            device=self.device,
-        )
-
-    def _clear_buffers(self):
-        del self.k_buffer
-        del self.v_buffer
-        del self.landmark_buffer
-
-    def get_kv_size_bytes(self):
-        assert hasattr(self, "k_buffer")
-        assert hasattr(self, "v_buffer")
-        k_size_bytes = 0
-        for k_cache in self.k_buffer:
-            k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
-        v_size_bytes = 0
-        for v_cache in self.v_buffer:
-            v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
-        return k_size_bytes, v_size_bytes
-    
-    def get_landmark_size_bytes(self):
-        assert hasattr(self, "landmark_buffer")
-        landmark_size_bytes = 0
-        for landmark_cache in self.landmark_buffer:
-            landmark_size_bytes += np.prod(landmark_cache.shape) * landmark_cache.dtype.itemsize
         
-        return landmark_size_bytes
+    def _clear_buffers(self):
+        del self.cache
+       
 
+    def get_cache_size_bytes(self) -> int:
+        """
+        Return total bytes occupied by all tensors in `self.cache`.
+        Works even if some entries are not tensors.
+        """
+        total_bytes = 0
+
+        for layer_cache in self.cache:
+            if not isinstance(layer_cache, dict):
+                # Be tolerant to unexpected structures
+                continue
+
+            for t in layer_cache.values():
+                if not torch.is_tensor(t):
+                    continue
+
+                # Prefer accurate allocated size if available (includes padding/strides)
+                try:
+                    total_bytes += int(t.untyped_storage().nbytes())
+                except AttributeError:
+                    # Fallback: logical size in bytes
+                    total_bytes += int(t.element_size() * t.numel())
+
+        return total_bytes
+    
+    def get_kv_size_bytes(self):
+        
+        raise NotImplementedError
+    
     # for disagg
     def get_contiguous_buf_infos(self):
         
@@ -196,47 +212,21 @@ class VTXTokenToKVPool(KVCache):
 
     def get_key_buffer(self, layer_id: int):
         
-        assert self.layer_transfer_counter is None
-        return self.k_buffer[layer_id - self.start_layer]
+        return self.cache[layer_id - self.start_layer]["k"]
 
     def get_value_buffer(self, layer_id: int):
         
-        assert self.layer_transfer_counter is None
-        return self.v_buffer[layer_id - self.start_layer]
+        return self.cache[layer_id - self.start_layer]["v"]
 
-    def get_kv_buffer(self, layer_id: int):
-        return self.k_buffer[layer_id - self.start_layer], self.v_buffer[layer_id - self.start_layer]
+    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        return self.cache[layer_id - self.start_layer]["k"], self.cache[layer_id - self.start_layer]["v"]
 
-    def get_landmark_buffer(self, layer_id: int):
         
-        return self.landmark_buffer[layer_id - self.start_layer]
-    
-    
-    
-    def set_kv_buffer_decode(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
-    ):
+    def get_cache(self, layer_id: int)->Dict[str, torch.Tensor]:
         
-        
-        layer_id = layer.layer_id
-        
-        FuseUpdateKVLandmark(
-            cache_k.contiguous(),
-            cache_v.contiguous(),
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
-            self.landmark_buffer[layer_id - self.start_layer],
-            loc,
-            self.page_size
-        )
-        
+        return self.cache[layer_id - self.start_layer]
+
         
     def set_kv_buffer(
         self,
@@ -258,24 +248,17 @@ class VTXTokenToKVPool(KVCache):
         
         layer_id = layer.layer_id
         
-        set_kv_buffer_launcher(
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+        vortex_torch.cache.set_kv_buffer_launcher(
+            self.cache[layer_id - self.start_layer]["k"],
+            self.cache[layer_id - self.start_layer]["v"],
             cache_k.contiguous(),
             cache_v.contiguous(),
             loc,
             self.page_size
         )
         
-        update_landmark_launcher(
-            self.k_buffer[layer_id - self.start_layer],
-            self.landmark_buffer[layer_id - self.start_layer],
-            loc,
-            self.page_size,
-            self.head_num,
-            self.head_dim
-        )
-
+        self.sparse_attention.forward_cache(self.cache[layer_id - self.start_layer], loc, ctx=self.ctx)
+        
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         
         raise NotImplementedError

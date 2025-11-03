@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union, Dict, Tuple
 from functools import partial
 import torch
 import vortex_torch
-
+from vortex_torch import as_vtensor, FORMAT
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
@@ -28,7 +28,7 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.mem_cache.vtx_memory_pool import VTXTokenToKVPool
+from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -55,7 +55,7 @@ class PrefillMetadata:
 global_workspace_buffer = None
 
 
-class VTXCGAttnBackend(AttentionBackend):
+class VTXGraphAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
     def __init__(
@@ -256,14 +256,14 @@ class VTXCGAttnBackend(AttentionBackend):
         
         self.sparse_attention = model_runner.sparse_attention
         self.ctx = vortex_torch.indexer.Context()
-        self.initialize(model_runner)
+        self._initialize_graph(model_runner)
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata: Dict[int, List[BatchDecodeWithPagedKVCacheWrapper]] = {}
         self.plan_graph: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph]]
     
 
-    def initialize(self, model_runner: "ModelRunner") -> None:
+    def _initialize_graph(self, model_runner: "ModelRunner") -> None:
         """
         Initialize execution context and warm up kernels/graphs with minimal dummy tensors.
 
@@ -294,17 +294,27 @@ class VTXCGAttnBackend(AttentionBackend):
         self.ctx.profile()  # enter 'profile' mode during warm-up
 
         # ---- Minimal warm-up tensors (placeholders only) ----
-        B, S = 1, 1
         dtype = torch.bfloat16
 
         try:
             with torch.no_grad():
                 # Dummy placeholders: used only for kernel / graph warm-up
-                q_dummy = torch.empty((B, S, self.head_dim), device=device, dtype=dtype)
-                landmark_dummy = torch.empty((B, S, self.head_dim), device=device, dtype=dtype)
-                o_dummy = torch.empty((B, S, 1), device=device, dtype=dtype)
+                q_dummy = as_vtensor(torch.empty((1, self.group_size, self.head_dim), device=device, dtype=dtype), FORMAT.BATCHED)
+                o_dummy = as_vtensor(torch.empty((0, 1, 1), device=device, dtype=dtype), FORMAT.RAGGED)
+                cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
+                
+                cache_dummy = {
+                        cache_name:  as_vtensor(torch.zeros(
+                                (0, cache_shape[0], cache_shape[1]),
+                                dtype=dtype,
+                                device=device,
+                            ), FORMAT.PAGED)
+                        
+                        for (cache_name, cache_shape) in cache_meta_info.items()
+                    }
+                
+                indexer(q_dummy, o_dummy, cache_dummy, ctx=self.ctx)
 
-                indexer(q_dummy, o_dummy, landmark_dummy, ctx=self.ctx)
 
         except Exception:
             raise
@@ -557,7 +567,7 @@ class VTXCGAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         
-        assert isinstance(forward_batch.token_to_kv_pool, VTXTokenToKVPool)
+        assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
         
@@ -638,7 +648,7 @@ class VTXCGAttnBackend(AttentionBackend):
         """
 
         # Sanity checks and setup
-        assert isinstance(forward_batch.token_to_kv_pool, VTXTokenToKVPool)
+        assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
 
@@ -646,13 +656,16 @@ class VTXCGAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer_decode(
+                forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Read K/V for this layer from the pool
-        k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
+        # Read Cache from memory pool
+        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+        
+        cache_k = cache["k"].view(-1, self.page_size, 1, self.head_dim)
+        cache_v = cache["v"].view(-1, self.page_size, 1, self.head_dim)
+        
         # Decide whether to use sparsity on this layer
         use_sparsity = (layer.layer_id not in self.layers_skip)
 
@@ -660,21 +673,18 @@ class VTXCGAttnBackend(AttentionBackend):
             # Prepare Q in grouped shape expected by sparse path
             q = q.view(-1, self.group_size, layer.head_dim).contiguous()
 
-            # Landmarks for sparse indexing
-            landmarks = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
-
             # Build sparse indices into paged KV buffers
             self.sparse_attention.forward_indexer(
                 q=q,
                 o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
-                landmark=landmarks,
+                cache=cache,
                 ctx=self.ctx
             )
 
             # Sparse attention compute
             o = self.forward_metadata.decode_wrappers[1].forward(
                 q,
-                (k, v),
+                (cache_k, cache_v),
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
                 k_scale=layer.k_scale,
@@ -685,7 +695,7 @@ class VTXCGAttnBackend(AttentionBackend):
             # Dense attention path
             o = self.forward_metadata.decode_wrappers[0].forward(
                 q.contiguous().view(-1, self.group_size, layer.head_dim),
-                (k, v),
+                (cache_k, cache_v),
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
                 k_scale=layer.k_scale,

@@ -8,7 +8,7 @@ def main():
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=False,
                     page_size=16,
-                    vortex_num_selected_pages=30,   
+                    vortex_topk_val=30,   
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
                     enable_vortex_sparsity=True,
@@ -16,6 +16,8 @@ def main():
                     vortex_page_reserved_eos=1,
                     vortex_layers_skip=list(range(1)),
                     vortex_cg=True,
+                    vortex_graph=True,
+                    vortex_module_name="block_sparse_attention",
                     vortex_max_seq_lens=8192
                     )
     
