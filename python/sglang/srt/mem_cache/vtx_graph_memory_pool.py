@@ -27,7 +27,7 @@ from sglang.srt.utils import (
 )
 
 import vortex_torch
-from vortex_torch import as_vtensor, FORMAT
+from vortex_torch.abs import as_vtensor, FORMAT
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()

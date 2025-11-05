@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union, Dict, Tuple
 from functools import partial
 import torch
 import vortex_torch
-from vortex_torch import as_vtensor, FORMAT
+from vortex_torch.abs import as_vtensor, FORMAT
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
