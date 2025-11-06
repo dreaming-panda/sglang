@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 
 
 def main():
-    model_name = "Qwen/Qwen3-1.7B"
+    model_name = "Qwen/Qwen3-14B"
 
     # Engine configuration for CPU-based KV cache
     llm = sgl.Engine(
@@ -68,7 +68,7 @@ def main():
         "temperature": 0.6,
         "top_p": 0.95,
         "top_k": 20,
-        "max_new_tokens": 50
+        "max_new_tokens": 1024
     }
 
     with open("output_cpu.jsonl", "w", encoding="utf-8") as f:

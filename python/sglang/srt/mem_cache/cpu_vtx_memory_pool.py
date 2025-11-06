@@ -140,7 +140,7 @@ class CPUVTXTokenToKVPool(KVCache):
                                 self.vortex_page_reserved_bos +
                                 self.vortex_page_reserved_eos)
             staging_num_tokens = max_batch_size * pages_per_request * self.page_size
-            BUFFER_SIZE = 4096
+            BUFFER_SIZE = 16
 
             print(f"CPU-cached vortex staging buffer sizing: "
                   f"max_batch_size={max_batch_size}, "

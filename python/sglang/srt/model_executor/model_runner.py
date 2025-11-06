@@ -1089,7 +1089,7 @@ class ModelRunner:
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
-            max_num_reqs = min(self.max_total_num_tokens // (self.model_config.context_len // 2), 256)
+            max_num_reqs = min(self.max_total_num_tokens // (self.model_config.context_len // 2), 32)
         else:
             max_num_reqs = min(
                 max(

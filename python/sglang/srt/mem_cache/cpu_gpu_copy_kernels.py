@@ -1422,3 +1422,60 @@ def copy_pages_to_staging_slots_dedup_lru(
     # print(f"[DEBUG] Pass E took {final:.4f} ms")
 
     return dst_staging_slots[:num_pages]
+
+
+def copy_pages_to_staging_slots_lru_warp(
+    cpu_k_buffer: torch.Tensor,
+    cpu_v_buffer: torch.Tensor,
+    gpu_k_staging: torch.Tensor,
+    gpu_v_staging: torch.Tensor,
+    src_page_ids: torch.Tensor,
+    cpu_to_gpu_slot_map: torch.Tensor,
+    gpu_to_cpu_page_map: torch.Tensor,
+    slot_ages: torch.Tensor,
+    page_size: int,
+    owners_bitmap: torch.Tensor,
+    slots_used_bitmap: torch.Tensor,
+    dst_staging_slots: torch.Tensor,
+    overflow_flag: torch.Tensor,
+):
+    assert cpu_k_buffer.is_pinned() and cpu_v_buffer.is_pinned()
+    assert gpu_k_staging.is_cuda and gpu_v_staging.is_cuda
+    assert cpu_k_buffer.dim() == 3 and cpu_k_buffer.shape[1] == 1
+    assert gpu_k_staging.dim() == 3 and gpu_k_staging.shape[1] == 1
+
+    num_pages = src_page_ids.shape[0]
+    head_dim = int(cpu_k_buffer.shape[2])
+    
+    vortex_C.allocate_pages_lru_warp(
+        src_page_ids,
+        cpu_to_gpu_slot_map,
+        gpu_to_cpu_page_map,
+        slot_ages,
+        slots_used_bitmap,
+        dst_staging_slots,
+        owners_bitmap,
+        overflow_flag,
+        MAX_HASH_ATTEMPTS=30
+    )
+
+    if overflow_flag[0] == 1:
+        print("Warning: GPU slot overflow detected!")
+
+    if torch.any(dst_staging_slots < 0):
+        print("Warning: Some pages failed to allocate staging slots!")
+
+    # start_event.record()
+    # Step 5: Copy only unique pages (owners)
+    vortex_C.copy_with_assigned_slots(
+        cpu_k_buffer, cpu_v_buffer,
+        gpu_k_staging, gpu_v_staging,
+        src_page_ids,
+        dst_staging_slots,
+        owners_bitmap,
+        page_size=page_size,
+        head_dim=head_dim,
+        num_pages=num_pages,
+    )
+
+    return dst_staging_slots[:num_pages]
