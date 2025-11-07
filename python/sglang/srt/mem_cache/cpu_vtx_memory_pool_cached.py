@@ -38,6 +38,7 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
         self.temp_staging_slots = []
         self.temp_overflow_flags = []
         self.temp_slots_used_bitmaps = []
+        self.temp_needs_eviction_bitmap = []
 
         for _ in range(self.layer_num):
             # CPU→GPU slot mapping: cpu_page_id → gpu_staging_slot (-1 if not cached)
@@ -67,6 +68,9 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
                 torch.zeros(1, dtype=torch.int32, device=self.device).contiguous()
             )
             self.temp_slots_used_bitmaps.append(
+                torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
+            )
+            self.temp_needs_eviction_bitmap.append(
                 torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
             )
 
@@ -112,14 +116,15 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
                 page_size=self.page_size,
                 owners_bitmap=self.temp_owners_bitmaps[layer_idx],
                 slots_used_bitmap=self.temp_slots_used_bitmaps[layer_idx],
+                needs_eviction_bitmap=self.temp_needs_eviction_bitmap[layer_idx],
                 dst_staging_slots=self.temp_staging_slots[layer_idx],
                 overflow_flag=self.temp_overflow_flags[layer_idx],
             )
 
-        torch.cuda.synchronize()
-        end_time = time.time()
-        final = (end_time - start_time) * 1000.0
-        print(f"[DEBUG] CPU->GPU sparse KV staging copy with persistent cache took {final:.4f} ms")
+        # torch.cuda.synchronize()
+        # end_time = time.time()
+        # final = (end_time - start_time) * 1000.0
+        # print(f"[DEBUG] CPU->GPU sparse KV staging copy with persistent cache took {final:.4f} ms")
         
         return k_staging, v_staging, staging_slots_all
 
@@ -159,10 +164,10 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
             cpu_to_gpu_map,
             self.max_page_id,
         )
-        torch.cuda.synchronize()
-        end_time = time.time()
-        final = (end_time - start_time) * 1000.0
-        print(f"[DEBUG] Storage time {final:.4f} ms")
+        # torch.cuda.synchronize()
+        # end_time = time.time()
+        # final = (end_time - start_time) * 1000.0
+        # print(f"[DEBUG] Storage time {final:.4f} ms")
         
         import time
         start_time = time.time()
@@ -174,7 +179,7 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
             num_kv_head=self.head_num,
             head_dim=self.head_dim,
         )
-        torch.cuda.synchronize()
-        end_time = time.time()
-        final = (end_time - start_time) * 1000.0
-        print(f"[DEBUG] Update time {final:.4f} ms")
+        # torch.cuda.synchronize()
+        # end_time = time.time()
+        # final = (end_time - start_time) * 1000.0
+        # print(f"[DEBUG] Update time {final:.4f} ms")

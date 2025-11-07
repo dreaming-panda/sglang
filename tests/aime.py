@@ -82,7 +82,7 @@ def main():
     ) for text in texts
     ] * 8
     
-    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 16384}
+    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 16000}
     total_tokens = 0
     total_time = 0.0
     start = time.perf_counter()
