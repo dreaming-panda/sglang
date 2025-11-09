@@ -17,7 +17,7 @@ def main():
                     vortex_layers_skip=list(range(1)),
                     vortex_cg=True,
                     vortex_graph=True,
-                    vortex_module_name="block_sparse_attention",
+                    vortex_module_name="gqa_block_sparse_attention",
                     vortex_max_seq_lens=8192
                     )
     

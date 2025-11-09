@@ -196,7 +196,7 @@ class ServerArgs:
     vortex_max_seq_lens: int = -1
     vortex_lb_max_chunk_size: int = 32
     vortex_lb_min_chunk_size: int = 8
-    vortex_indexer_dtype: str = "float32"
+    vortex_indexer_dtype: str = "bfloat16"
     vortex_module_path: str = None
     vortex_module_name: str = None
     
