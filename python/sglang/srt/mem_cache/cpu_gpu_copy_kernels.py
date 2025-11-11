@@ -1476,7 +1476,7 @@ def copy_pages_to_staging_slots_lru_warp(
     #     print("Warning: Some pages failed to allocate staging slots!")
 
     # start_event.record()
-    vortex_C.copy_with_assigned_slots(
+    vortex_C.copy_with_assigned_slots_optimized(
         cpu_k_buffer, cpu_v_buffer,
         gpu_k_staging, gpu_v_staging,
         src_page_ids,

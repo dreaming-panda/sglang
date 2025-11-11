@@ -4,13 +4,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 from sglang.srt.mem_cache.cpu_vtx_memory_pool import CPUVTXTokenToKVPool
 from sglang.srt.mem_cache.cpu_gpu_copy_kernels import (
-    copy_pages_to_staging_slots_dedup,
-    copy_pages_to_staging_slots_dedup_lru,
-    copy_pages_to_staging_slots_simple_lru,
-    copy_pages_to_staging_slots_lru_warp,
     store_kv_cpu_and_gpu,
     update_landmark_from_cpu
 )
+import vortex_C
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +92,10 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
 
         cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[layer_idx]
         gpu_to_cpu_map = self.gpu_to_cpu_page_maps[layer_idx]
-        # print("cache hits", gpu_slots_valid.numel() / sparse_indices.numel())
+        dst_staging_slots = self.temp_staging_slots[layer_idx]
+        
+        # gpu_slots_valid = (cpu_to_gpu_map[sparse_indices] != -1).sum()
+        # print(layer_id, "cache hits", gpu_slots_valid / sparse_indices.numel())
 
         # torch.cuda.synchronize()
         # Copy with persistent bidirectional mapping and available slots
@@ -104,7 +104,7 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
 
         if self.eviction_policy == "lru":
             # Use LRU eviction policy with dedup and pre-allocated buffers
-            staging_slots_all = copy_pages_to_staging_slots_lru_warp(
+            vortex_C.copy_pages_to_staging_slots_lru_warp(
                 cpu_k_buffer=self.k_buffer[layer_idx],
                 cpu_v_buffer=self.v_buffer[layer_idx],
                 gpu_k_staging=k_staging,
@@ -117,16 +117,16 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
                 owners_bitmap=self.temp_owners_bitmaps[layer_idx],
                 slots_used_bitmap=self.temp_slots_used_bitmaps[layer_idx],
                 needs_eviction_bitmap=self.temp_needs_eviction_bitmap[layer_idx],
-                dst_staging_slots=self.temp_staging_slots[layer_idx],
+                dst_staging_slots=dst_staging_slots,
                 overflow_flag=self.temp_overflow_flags[layer_idx],
             )
 
-        # torch.cuda.synchronize()
-        # end_time = time.time()
-        # final = (end_time - start_time) * 1000.0
-        # print(f"[DEBUG] CPU->GPU sparse KV staging copy with persistent cache took {final:.4f} ms")
+        torch.cuda.synchronize()
+        end_time = time.time()
+        final = (end_time - start_time) * 1000.0
+        print(f"[DEBUG] CPU->GPU sparse KV staging copy with persistent cache took {final:.4f} ms")
         
-        return k_staging, v_staging, staging_slots_all
+        return k_staging, v_staging, dst_staging_slots
 
     def set_kv_buffer(
         self,
@@ -150,8 +150,8 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
         # Store to CPU and update GPU staging buffer if page is cached
         # torch.cuda.synchronize()
         # # Copy with persistent bidirectional mapping and available slots
-        import time
-        start_time = time.time()
+        # import time
+        # start_time = time.time()
         store_kv_cpu_and_gpu(
             cpu_k_buffer,
             cpu_v_buffer,
@@ -169,8 +169,8 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
         # final = (end_time - start_time) * 1000.0
         # print(f"[DEBUG] Storage time {final:.4f} ms")
         
-        import time
-        start_time = time.time()
+        # import time
+        # start_time = time.time()
         update_landmark_from_cpu(
             cpu_k_buffer=cpu_k_buffer,
             gpu_landmark=self.landmark_buffer[layer_id - self.start_layer],
