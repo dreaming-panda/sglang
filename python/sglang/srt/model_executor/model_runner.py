@@ -89,7 +89,6 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 
-from sglang.srt.mem_cache.vtx_memory_pool import VTXTokenToKVPool
 from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
