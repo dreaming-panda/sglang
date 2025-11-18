@@ -10,7 +10,7 @@ def main():
                     page_size=16,
                     vortex_topk_val=30,   
                     disable_overlap_schedule=True,
-                    attention_backend="fa3",
+                    attention_backend="flashinfer",
                     enable_vortex_sparsity=True,
                     vortex_page_reserved_bos=1,
                     vortex_page_reserved_eos=1,
