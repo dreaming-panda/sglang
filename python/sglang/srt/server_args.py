@@ -190,9 +190,6 @@ class ServerArgs:
     vortex_layers_skip: Optional[List[int]] = None
     vortex_page_reserved_bos: int = 1
     vortex_page_reserved_eos: int = 1
-    vortex_profile: bool = False
-    vortex_cg: bool = False
-    vortex_graph: bool = False
     vortex_max_seq_lens: int = -1
     vortex_lb_max_chunk_size: int = 32
     vortex_lb_min_chunk_size: int = 8

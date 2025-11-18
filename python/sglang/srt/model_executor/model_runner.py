@@ -960,20 +960,11 @@ class ModelRunner:
             )
         elif self.server_args.enable_vortex_sparsity:
             
-            if self.server_args.vortex_graph:
-                cell_size = (
+            cell_size = (
                     self.model_config.get_num_kv_heads(get_attention_tp_size())
                     * self.model_config.head_dim
                     * num_layers
                     * self.sparse_attention.get_token_ratio(self.page_size, self.model_config.head_dim)
-                    * torch._utils._element_size(self.kv_cache_dtype)
-                )
-            else:
-                cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * self.model_config.head_dim
-                    * num_layers
-                    * (2 + 1.0 / self.page_size)
                     * torch._utils._element_size(self.kv_cache_dtype)
                 )
         else:
@@ -1210,8 +1201,6 @@ class ModelRunner:
                     device=self.device,
                 )
             elif self.server_args.enable_vortex_sparsity:
-                
-                if self.server_args.vortex_graph:
                     
                     self.token_to_kv_pool = VTXGraphCachePool(
                         self.max_total_num_tokens,
@@ -1230,21 +1219,6 @@ class ModelRunner:
                         end_layer=self.end_layer,
                     )
                 
-                else:
-                    self.token_to_kv_pool = VTXTokenToKVPool(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                    )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
@@ -1324,25 +1298,13 @@ class ModelRunner:
         if self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
                 
-                if self.server_args.vortex_graph:
-                    from sglang.srt.layers.attention.vtx_graph_backend import (
+                from sglang.srt.layers.attention.vtx_graph_backend import (
                         VTXGraphAttnBackend,
-                    )
+                )
                     
-                    return VTXGraphAttnBackend(self)
+                return VTXGraphAttnBackend(self)
                 
-                elif not self.server_args.vortex_cg:
-                    from sglang.srt.layers.attention.vtx_flashinfer_backend import (
-                        VTXFlashInferAttnBackend,
-                    )
-                    
-                    return VTXFlashInferAttnBackend(self)
-                else:
-                    from sglang.srt.layers.attention.vtx_cg_backend import (
-                        VTXCGAttnBackend,
-                    )
-                    
-                    return VTXCGAttnBackend(self)
+                
             elif not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
@@ -1398,11 +1360,17 @@ class ModelRunner:
                 "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
                 "Please use `--attention-backend flashinfer`."
             )
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
+            if self.server_args.enable_vortex_sparsity:
+                from sglang.srt.layers.attention.vtx_fa3_backend import (
+                    VTXFA3AttnBackend
+                )
+                return VTXFA3AttnBackend(self)
+            else:
+                from sglang.srt.layers.attention.flashattention_backend import (
+                    FlashAttentionBackend,
+                )
 
-            return FlashAttentionBackend(self)
+                return FlashAttentionBackend(self)
         elif self.server_args.attention_backend == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
