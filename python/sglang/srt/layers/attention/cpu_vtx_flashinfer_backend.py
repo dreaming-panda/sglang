@@ -509,7 +509,6 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         
-        assert isinstance(forward_batch.token_to_kv_pool, CPUVTXTokenToKVPool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
         
@@ -579,7 +578,6 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
         3. Copy sparse KV pages from CPU to GPU staging buffer
         4. Run attention on GPU with staging buffer
         """
-        assert isinstance(forward_batch.token_to_kv_pool, CPUVTXTokenToKVPool)
         assert not layer.is_cross_attention
 
         cache_loc = forward_batch.out_cache_loc
@@ -591,7 +589,7 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                forward_batch.token_to_kv_pool.set_kv_buffer_decode(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
