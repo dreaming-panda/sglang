@@ -13,7 +13,7 @@ def main():
                     vortex_topk_val=30,   
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
-                    enable_vortex_sparsity=True,
+                    enable_vortex_sparsity=False,
                     vortex_page_reserved_bos=1,
                     vortex_page_reserved_eos=1,
                     vortex_layers_skip=list(range(1)),
