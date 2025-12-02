@@ -186,12 +186,15 @@ class ServerArgs:
     # Vortex Sparse Attention
     enable_vortex_sparsity: bool = False
     vortex_sparse_attention_algorithm: str = 'BLOCK_TOPK'
-    vortex_num_selected_pages: int = 32
+    vortex_num_selected_pages: int = 30
     vortex_layers_skip: Optional[List[int]] = None
     vortex_page_reserved_bos: int = 1
     vortex_page_reserved_eos: int = 1
     enable_cpu_vtx_cache: bool = False  # Enable LRU cache for CPU VTX staging buffer
-    
+    vortex_profile: bool = False
+    vortex_cg: bool = False
+    vortex_max_seq_lens: int = -1
+
     
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -569,7 +572,7 @@ class ServerArgs:
 
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
-
+                
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
         smaller_tp = min(decode_tp, prefill_tp)
@@ -1668,6 +1671,49 @@ class ServerArgs:
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
         )
+        parser.add_argument(
+            "--enable-vortex-sparsity",
+            action="store_true",
+        )
+        parser.add_argument(
+            "--vortex-cg",
+            action="store_true",
+        )
+        parser.add_argument(
+            "--vortex-profile",
+            action="store_true",
+        )
+        parser.add_argument(
+            "--vortex-num-selected-pages",
+            type=int,
+            default=ServerArgs.vortex_num_selected_pages,
+        )
+        parser.add_argument(
+            "--vortex-page-reserved-bos",
+            type=int,
+            default=ServerArgs.vortex_page_reserved_bos,
+        )
+        parser.add_argument(
+            "--vortex-page-reserved-eos",
+            type=int,
+            default=ServerArgs.vortex_page_reserved_eos,
+        )
+        parser.add_argument(
+            "--vortex-layers-skip",
+            type=int,
+            nargs="+",
+        )
+        parser.add_argument(
+            "--vortex-sparse-attention-algorithm",
+            type=str,
+            default=ServerArgs.vortex_sparse_attention_algorithm,
+        )
+        parser.add_argument(
+            "--vortex-max-seq-lens",
+            type=int,
+            default=ServerArgs.vortex_max_seq_lens,
+        )
+        
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

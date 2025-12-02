@@ -1394,11 +1394,18 @@ class ModelRunner:
             return CPUVTXFlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
-                from sglang.srt.layers.attention.vtx_flashinfer_backend import (
-                    VTXFlashInferAttnBackend,
-                )
-
-                return VTXFlashInferAttnBackend(self)
+                if not self.server_args.vortex_cg:
+                    from sglang.srt.layers.attention.vtx_flashinfer_backend import (
+                        VTXFlashInferAttnBackend,
+                    )
+    
+                    return VTXFlashInferAttnBackend(self)
+                else:
+                    from sglang.srt.layers.attention.vtx_cg_backend import (
+                        VTXCGAttnBackend,
+                    )
+                    
+                    return VTXCGAttnBackend(self)
             elif not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
