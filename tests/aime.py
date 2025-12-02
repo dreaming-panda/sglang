@@ -48,11 +48,11 @@ def generate_requests(dataset: Dataset, field_name: str, data_format: str, trial
 
 def main():
     model_name = "Qwen/Qwen3-14B"
-    llm = sgl.Engine(model_path=model_name, 
-                    disable_cuda_graph=True,
+    llm = sgl.Engine(model_path=model_name,
+                    disable_cuda_graph=False,
                     page_size=16,
                     mem_fraction_static=0.5,
-                    vortex_num_selected_pages=30,       
+                    vortex_num_selected_pages=30,
                     disable_overlap_schedule=True,
                     attention_backend="cpu_vtx_flashinfer",
                     enable_vortex_sparsity=True,
@@ -60,6 +60,7 @@ def main():
                     vortex_page_reserved_eos=1,
                     vortex_layers_skip=[],
                     enable_cpu_vtx_cache=True,
+                    vortex_cg=True,
                     kv_cache_dtype="auto",
                     )
     
@@ -82,7 +83,7 @@ def main():
     ) for text in texts
     ] * 8
     
-    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 128}
+    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 4096}
     total_tokens = 0
     total_time = 0.0
     start = time.perf_counter()
@@ -90,7 +91,7 @@ def main():
     elapsed = time.perf_counter() - start
     total_time += elapsed
     e2e_time = 0
-    with open(f"DATA/Qwen3-0.6B/AIME24_VTX_cache_16K.jsonl", "w", encoding="utf-8") as f:
+    with open(f"DATA/Qwen3-14B/AIME24_VTX_CG_16K.jsonl", "w", encoding="utf-8") as f:
         for item in o:
             total_tokens += item["meta_info"]["completion_tokens"] 
             e2e_time = max(e2e_time, item["meta_info"]["e2e_latency"])

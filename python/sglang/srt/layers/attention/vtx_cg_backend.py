@@ -454,7 +454,6 @@ class VTXCGAttnBackend(AttentionBackend):
     ):
         assert forward_mode.is_decode_or_idle()
         
-        
         self.vtx_api.plan_decode(
             cached_seq_lens=seq_lens.to(torch.int32),
             dense_kv_indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads + 1],
@@ -578,6 +577,8 @@ class VTXCGAttnBackend(AttentionBackend):
         assert isinstance(forward_batch.token_to_kv_pool, VTXTokenToKVPool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
+        
+        bs = len(forward_batch.req_pool_indices)
         
         if k is not None:
             assert v is not None

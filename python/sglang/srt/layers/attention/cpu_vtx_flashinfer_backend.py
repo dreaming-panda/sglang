@@ -338,20 +338,51 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
         ]
 
         # Vortex sparse attention server
+        min_chunk_size = 8
+        max_chunk_size = 32
+        max_seq_lengths = model_runner.model_config.context_len
+
+        maximum_num_pages = (max_bs * max_seq_lengths * self.num_kv_heads // self.page_size) + max_bs * self.num_kv_heads
+        maximum_num_workloads = (maximum_num_pages // min_chunk_size) + max_bs * self.num_kv_heads
+
+        # Workload info buffers for vortex sparse attention
+        self.winfo_q_indices = torch.zeros(
+            (maximum_num_workloads,), dtype=torch.int32, device=model_runner.device)
+
+        self.winfo_kv_offsets = torch.zeros(
+            (maximum_num_workloads,), dtype=torch.int32, device=model_runner.device)
+
+        self.winfo_kv_lens = torch.zeros(
+            (maximum_num_workloads,), dtype=torch.int32, device=model_runner.device)
+
+        self.winfo_num_workloads = torch.zeros(
+            (1,), dtype=torch.int32, device=model_runner.device)
+
+        self.winfo_chunk_size = torch.zeros(
+            (1,), dtype=torch.int32, device=model_runner.device)
+
+        self.buffer = torch.zeros(
+            (maximum_num_pages,), dtype=torch.float32, device=model_runner.device
+        )
+
         self.vtx_api = SparseAttentionServer(
             head_dim=self.head_dim,
             num_kv_heads=self.num_kv_heads,
             num_qo_heads=self.num_qo_heads,
             page_size=model_runner.server_args.page_size,
             max_batch_size=max_bs,
-            max_seq_lengths=model_runner.model_config.context_len,
+            max_seq_lengths=max_seq_lengths,
             max_prefill_lengths=model_runner.server_args.max_prefill_tokens,
             max_num_tokens=model_runner.max_total_num_tokens,
-            min_chunk_size=8,
-            max_chunk_size=32,
+            min_chunk_size=min_chunk_size,
+            max_chunk_size=max_chunk_size,
             num_selected_pages=model_runner.server_args.vortex_num_selected_pages,
-            page_reserved_bos=model_runner.server_args.vortex_page_reserved_bos, 
+            page_reserved_bos=model_runner.server_args.vortex_page_reserved_bos,
             page_reserved_eos=model_runner.server_args.vortex_page_reserved_eos,
+            max_num_pages_per_request=(model_runner.model_config.context_len + model_runner.server_args.page_size - 1) \
+                // model_runner.server_args.page_size if model_runner.server_args.vortex_max_seq_lens < 0 \
+                    else (model_runner.server_args.vortex_max_seq_lens + model_runner.server_args.page_size - 1) \
+                        // model_runner.server_args.page_size,
             algo_name=model_runner.server_args.vortex_sparse_attention_algorithm
         )
 
@@ -368,7 +399,7 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             bs = len(forward_batch.req_pool_indices)
 
-            # Plan decode with vortex to get sparse indices
+            # Plan decode with vortex to get sparse indices (same as GPU CG version)
             self.vtx_api.plan_decode(
                 cached_seq_lens=forward_batch.seq_lens.to(torch.int32),
                 dense_kv_indptr=self.kv_indptr[1][:bs * self.num_kv_heads + 1],
@@ -378,6 +409,11 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
                 kv_last_page_len=self.kv_last_page_len[1][:bs * self.num_kv_heads],
                 req_to_token=self.req_to_token,
                 req_indices=forward_batch.req_pool_indices,
+                winfo_q_indices=self.winfo_q_indices,
+                winfo_kv_offsets=self.winfo_kv_offsets,
+                winfo_kv_lens=self.winfo_kv_lens,
+                winfo_num_workload=self.winfo_num_workloads,
+                winfo_chunk_size=self.winfo_chunk_size,
             )
             
             # print(f"bs: {bs}")
@@ -478,7 +514,7 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
                 self.num_attn_groups,
                 1,
                 self.head_dim,
-                1,
+                self.page_size,  # Paged format: [num_pages, page_size, 1, head_dim]
                 q_data_type=self.q_data_type,
                 kv_data_type=self.data_type,
                 custom_mask=None,
@@ -594,38 +630,46 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
                 )
 
         if use_sparsity:
-            q_compress = q.contiguous().view(-1, self.num_attn_groups, layer.head_dim).sum(dim=-2)
+            q = q.view(-1, self.num_attn_groups, layer.head_dim).contiguous()
             landmarks = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
 
-            # Get sparse KV indices from vortex
-            self.vtx_api.get_sparse_kv_indices(
-                query=q_compress,
-                landmarks=landmarks.view(-1, layer.head_dim),
+            # Use matmul + topk_output like GPU CG version
+            self.vtx_api.matmul(
+                query=q,
+                landmarks=landmarks,
+                dense_kv_indptr=self.kv_indptr[1],
+                dense_kv_indices=self.kv_indices[1],
+                output=self.buffer,
+                winfo_q_indices=self.winfo_q_indices,
+                winfo_kv_offsets=self.winfo_kv_offsets,
+                winfo_kv_lens=self.winfo_kv_lens,
+                winfo_num_workload=self.winfo_num_workloads,
+                winfo_chunk_size=self.winfo_chunk_size,
+            )
+
+            self.vtx_api.topk_output(
+                score=self.buffer,
                 dense_kv_indptr=self.kv_indptr[1],
                 dense_kv_indices=self.kv_indices[1],
                 sparse_kv_indptr=self.kv_indptr[0],
                 sparse_kv_indices=self.kv_indices[0],
+                eff_batch_size=q.shape[0],
             )
 
             result = forward_batch.token_to_kv_pool.copy_sparse_kv_to_gpu(
                 layer_id=layer.layer_id,
                 sparse_kv_indices=self.kv_indices[0],
                 sparse_kv_indptr=self.kv_indptr[0],
+                dst_kv_indices=self.decode_wrappers[0]._paged_kv_indices_buf,
                 batch_size=bs,
             )
-            # torch.cuda.synchronize()
-            # end_time = time.time()
-            # final = (end_time - start_time) * 1000.0  # Convert seconds to milliseconds
-            # print(f"[DEBUG] CPU->GPU sparse KV staging copy took {final:.4f} ms")
-            
-            k_staging, v_staging, staging_kv_indices = result
-            self.decode_wrappers[0]._paged_kv_indices_buf = staging_kv_indices
 
-            k_staging = k_staging.view(-1, self.page_size, 1, self.head_dim)
-            v_staging = v_staging.view(-1, self.page_size, 1, self.head_dim)
-            
+            k_staging, v_staging, staging_kv_indices = result
+            # self.decode_wrappers[0]._paged_kv_indices_buf = staging_kv_indices
+            # Staging buffers are already in paged format [num_pages, page_size, 1, head_dim]
+
             o = self.decode_wrappers[0].forward(
-                q.contiguous().view(-1, self.num_attn_groups, layer.head_dim),
+                q,
                 (k_staging, v_staging),
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,

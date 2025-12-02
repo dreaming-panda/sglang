@@ -96,12 +96,15 @@ class CPUVTXTokenToKVPool(KVCache):
         assert self.store_dtype == torch.bfloat16
 
     def _create_buffers(self):
-        # KV buffers are stored on CPU
-        # [size, head_num, head_dim] for each layer
+        # Calculate num_pages matching GPU vtx_memory_pool format
+        self.num_pages = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
+
+        # KV buffers stored on CPU with paged format matching GPU vtx_memory_pool
+        # Shape: [num_pages, page_size, 1, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.k_buffer = [
             torch.zeros(
-                ((self.size + self.page_size) * self.head_num, 1, self.head_dim),
+                (self.num_pages, self.page_size, 1, self.head_dim),
                 dtype=self.store_dtype,
                 device='cpu',  # CPU storage
                 pin_memory=True,  # Pinned memory for faster GPU transfers
@@ -110,7 +113,7 @@ class CPUVTXTokenToKVPool(KVCache):
         ]
         self.v_buffer = [
             torch.zeros(
-                ((self.size + self.page_size) * self.head_num, 1, self.head_dim),
+                (self.num_pages, self.page_size, 1, self.head_dim),
                 dtype=self.store_dtype,
                 device='cpu',  # CPU storage
                 pin_memory=True,  # Pinned memory for faster GPU transfers
@@ -119,13 +122,11 @@ class CPUVTXTokenToKVPool(KVCache):
         ]
 
         # Landmarks stay on GPU for sparse selection
+        # Shape: [num_pages, head_dim] matching GPU vtx_memory_pool
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.landmark_buffer = [
                 torch.zeros(
-                    (
-                    ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size,
-                    1,
-                    self.head_dim),
+                    (self.num_pages, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,  # GPU storage
                 ).contiguous()
@@ -139,16 +140,19 @@ class CPUVTXTokenToKVPool(KVCache):
             pages_per_request = (self.vortex_num_selected_pages +
                                 self.vortex_page_reserved_bos +
                                 self.vortex_page_reserved_eos)
-            staging_num_tokens = max_batch_size * pages_per_request * self.page_size
-            BUFFER_SIZE = 4096
+            # Each request has pages_per_request pages per head, and head_num heads
+            staging_num_pages = max_batch_size * pages_per_request * self.head_num
+            BUFFER_SIZE = 256  # Extra pages for safety
 
             print(f"CPU-cached vortex staging buffer sizing: "
                   f"max_batch_size={max_batch_size}, "
-                  f"staging_tokens={staging_num_tokens}")
+                  f"staging_num_pages={staging_num_pages}")
 
+            # Staging buffers on GPU - paged format matching GPU vtx_memory_pool
+            # Shape: [num_staging_pages, page_size, 1, head_dim]
             self.k_staging_buffer = [
                 torch.zeros(
-                    ((staging_num_tokens + self.page_size + BUFFER_SIZE) * self.head_num, 1, self.head_dim),
+                    (staging_num_pages + BUFFER_SIZE, self.page_size, 1, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 ).contiguous()
@@ -156,7 +160,7 @@ class CPUVTXTokenToKVPool(KVCache):
             ]
             self.v_staging_buffer = [
                 torch.zeros(
-                    ((staging_num_tokens + self.page_size + BUFFER_SIZE) * self.head_num, 1, self.head_dim),
+                    (staging_num_pages + BUFFER_SIZE, self.page_size, 1, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 ).contiguous()
@@ -278,21 +282,20 @@ class CPUVTXTokenToKVPool(KVCache):
         layer_idx = layer_id - self.start_layer
         k_staging = self.k_staging_buffer[layer_idx]
         v_staging = self.v_staging_buffer[layer_idx]
-        
+
         assert k_staging.is_contiguous()
         assert v_staging.is_contiguous()
 
         # Use dedup kernel for efficient CPU->GPU sparse copy
         # sparse_indices already contains per-head page indices from Vortex API
-        # Calculate max_page_id from CPU buffer size
-        cpu_buffer = self.k_buffer[layer_id - self.start_layer]
-        max_page_id = (cpu_buffer.shape[0] // self.head_num) // self.page_size
+        # max_page_id is num_pages (paged format: [num_pages, page_size, 1, head_dim])
+        max_page_id = self.num_pages
 
         import time
         start_time = time.time()
         dst_staging_slots = copy_sparse_kv_cpu_to_gpu_dedup(
-            cpu_k_buffer=cpu_buffer,
-            cpu_v_buffer=self.v_buffer[layer_id - self.start_layer],
+            cpu_k_buffer=self.k_buffer[layer_idx],
+            cpu_v_buffer=self.v_buffer[layer_idx],
             gpu_k_staging=k_staging,
             gpu_v_staging=v_staging,
             src_page_ids=sparse_indices,

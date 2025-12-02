@@ -17,8 +17,9 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
         self.eviction_policy = eviction_policy
 
         # Calculate max page ID and staging buffer capacity
-        max_page_id = (self.size + self.page_size) * self.head_num // self.page_size
-        staging_buffer_capacity = self.k_staging_buffer[0].shape[0] // self.page_size
+        # Using paged format: [num_pages, page_size, 1, head_dim]
+        max_page_id = self.num_pages
+        staging_buffer_capacity = self.k_staging_buffer[0].shape[0]  # First dim is num_pages
 
         # Persistent state per layer
         self.cpu_to_gpu_slot_maps = []
@@ -74,6 +75,7 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
         sparse_kv_indices: torch.Tensor,
         sparse_kv_indptr: torch.Tensor,
         batch_size: int,
+        dst_kv_indices=None,
     ):
         """
         CUDA graph compatible sparse KV copy.
@@ -96,7 +98,11 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
 
         cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[layer_idx]
         gpu_to_cpu_map = self.gpu_to_cpu_page_maps[layer_idx]
-        dst_staging_slots = self.temp_staging_slots
+        
+        if dst_kv_indices is None:
+            dst_staging_slots = self.temp_staging_slots
+        else:
+            dst_staging_slots = dst_kv_indices
 
         if self.eviction_policy == "lru":
             # Use CUDA graph compatible kernel

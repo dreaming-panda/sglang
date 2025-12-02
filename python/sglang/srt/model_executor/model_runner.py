@@ -1089,7 +1089,7 @@ class ModelRunner:
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
-            max_num_reqs = min(self.max_total_num_tokens // self.model_config.context_len, 256)
+            max_num_reqs = max_num_reqs = min((self.max_total_num_tokens // self.model_config.context_len // 2) * 2, 256)
         else:
             max_num_reqs = min(
                 max(
@@ -1388,10 +1388,16 @@ class ModelRunner:
     def _get_attention_backend(self):
         if self.server_args.attention_backend == "cpu_vtx_flashinfer":
             # CPU-based KV cache with Vortex sparse attention
-            from sglang.srt.layers.attention.cpu_vtx_flashinfer_backend import (
-                CPUVTXFlashInferAttnBackend,
-            )
-            return CPUVTXFlashInferAttnBackend(self)
+            if not self.server_args.vortex_cg:
+                from sglang.srt.layers.attention.cpu_vtx_flashinfer_backend import (
+                    CPUVTXFlashInferAttnBackend,
+                )
+                return CPUVTXFlashInferAttnBackend(self)
+            else:
+                from sglang.srt.layers.attention.cpu_vtx_cg_backend import (
+                    CPUVTXCGAttnBackend,
+                )
+                return CPUVTXCGAttnBackend(self)
         elif self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
                 if not self.server_args.vortex_cg:
