@@ -607,36 +607,19 @@ class CPUVTXFlashInferAttnBackend(AttentionBackend):
                 sparse_kv_indices=self.kv_indices[0],
             )
 
-            # Copy sparse KV from CPU to GPU staging buffer
-            # Source layout: sparse_kv_indices[0] (from CPU cache)
-            # Target layout: contiguous [0, 1, 2, ..., num_pages-1] (in staging buffer)
-            # The kernel maps: CPU[sparse_indices[i]] -> GPU_staging[i]
-            num_sparse_pages = self.kv_indptr[0][bs * self.num_kv_heads].item()
-            sparse_indices = self.kv_indices[0][:num_sparse_pages].contiguous()
-            sparse_indptr = self.kv_indptr[0][: bs * self.num_kv_heads + 1].contiguous()
-
-            # Copy sparse KV to GPU staging buffer
-            # Non-cached version returns (k_staging, v_staging)
-            # Cached version returns (k_staging, v_staging, staging_kv_indices)
-            
-            import time
-            start_time = time.time()
             result = forward_batch.token_to_kv_pool.copy_sparse_kv_to_gpu(
                 layer_id=layer.layer_id,
-                sparse_indices=sparse_indices,
+                sparse_kv_indices=self.kv_indices[0],
+                sparse_kv_indptr=self.kv_indptr[0],
+                batch_size=bs,
             )
             # torch.cuda.synchronize()
             # end_time = time.time()
             # final = (end_time - start_time) * 1000.0  # Convert seconds to milliseconds
             # print(f"[DEBUG] CPU->GPU sparse KV staging copy took {final:.4f} ms")
             
-            if len(result) == 3:
-                # Cached version with LRU: use staging_kv_indices for indirection
-                k_staging, v_staging, staging_kv_indices = result
-                self.decode_wrappers[0]._paged_kv_indices_buf = staging_kv_indices
-            else:
-                # Non-cached version: staging buffer is contiguous [0, 1, 2, ...]
-                k_staging, v_staging = result
+            k_staging, v_staging, staging_kv_indices = result
+            self.decode_wrappers[0]._paged_kv_indices_buf = staging_kv_indices
 
             k_staging = k_staging.view(-1, self.page_size, 1, self.head_dim)
             v_staging = v_staging.view(-1, self.page_size, 1, self.head_dim)
