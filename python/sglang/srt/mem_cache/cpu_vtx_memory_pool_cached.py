@@ -103,6 +103,20 @@ class CPUVTXTokenToKVPoolCached(CPUVTXTokenToKVPool):
             dst_staging_slots = self.temp_staging_slots
         else:
             dst_staging_slots = dst_kv_indices
+            
+        # print(f"cpu_to_gpu_map shape: {cpu_to_gpu_map.shape}, gpu_to_cpu_map shape: {gpu_to_cpu_map.shape}, cpu_buffer shape: {self.k_buffer[layer_idx].shape}, gpu_buffer shape: {k_staging.shape}")
+            
+        # torch.cuda.synchronize()
+            
+        # num_sparse_pages = sparse_kv_indptr[batch_size * self.head_num].item()
+        # sparse_indices = sparse_kv_indices[:num_sparse_pages].contiguous()
+        
+        # actual = torch.unique(sparse_indices)
+        # need_to_transfer = (cpu_to_gpu_map[actual] == -1).sum().item()
+        # perc = (need_to_transfer / num_sparse_pages) * 100
+        
+        # print(f"Pages need to transfer: {need_to_transfer}, Total Pages: {num_sparse_pages}, Number of unique pages: {actual.shape[0]}, Percentage actually transferred: {perc}%")
+        
 
         if self.eviction_policy == "lru":
             # Use CUDA graph compatible kernel

@@ -51,8 +51,9 @@ def main():
     llm = sgl.Engine(model_path=model_name,
                     disable_cuda_graph=False,
                     page_size=16,
-                    mem_fraction_static=0.5,
-                    vortex_num_selected_pages=30,
+                    mem_fraction_static=0.8,
+                    cpu_mem_fraction=0.6,
+                    vortex_num_selected_pages=62,
                     disable_overlap_schedule=True,
                     attention_backend="cpu_vtx_flashinfer",
                     enable_vortex_sparsity=True,
@@ -83,7 +84,7 @@ def main():
     ) for text in texts
     ] * 8
     
-    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 4096}
+    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 128}
     total_tokens = 0
     total_time = 0.0
     start = time.perf_counter()
@@ -91,7 +92,7 @@ def main():
     elapsed = time.perf_counter() - start
     total_time += elapsed
     e2e_time = 0
-    with open(f"DATA/Qwen3-14B/AIME24_VTX_CG_16K.jsonl", "w", encoding="utf-8") as f:
+    with open(f"DATA/Qwen3-14B/AIME24_VTX_CG_Cache_16K.jsonl", "w", encoding="utf-8") as f:
         for item in o:
             total_tokens += item["meta_info"]["completion_tokens"] 
             e2e_time = max(e2e_time, item["meta_info"]["e2e_latency"])

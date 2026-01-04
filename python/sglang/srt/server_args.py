@@ -72,6 +72,7 @@ class ServerArgs:
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
+    cpu_mem_fraction: Optional[float] = None  # Fraction of total CPU memory for KV cache (CPU-cached vortex)
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
@@ -340,6 +341,10 @@ class ServerArgs:
             model_config = ModelConfig.from_server_args(self)
             if model_config.is_multimodal:
                 self.mem_fraction_static *= 0.90
+
+        # Set CPU memory fraction for CPU-cached vortex attention
+        if self.cpu_mem_fraction is None:
+            self.cpu_mem_fraction = 0.8  # Default to 80% of total CPU memory
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
@@ -799,6 +804,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--cpu-mem-fraction",
+            type=float,
+            default=ServerArgs.cpu_mem_fraction,
+            help="The fraction of total CPU memory to use for KV cache when using CPU-cached vortex attention. Default is 0.8 (80%%).",
         )
         parser.add_argument(
             "--max-running-requests",
