@@ -13,6 +13,8 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Union, Dict, Tuple
 from functools import partial
 import torch
+import vortex_torch
+from vortex_torch.abs import as_vtensor, FORMAT
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
@@ -26,7 +28,7 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.mem_cache.vtx_memory_pool import VTXTokenToKVPool
+from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -39,8 +41,6 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
-
-from vortex import SparseAttentionServer, attention_decode, broadcast_mv
 
 @dataclass
 class DecodeMetadata:
@@ -55,7 +55,7 @@ class PrefillMetadata:
 global_workspace_buffer = None
 
 
-class VTXAttnBackend(AttentionBackend):
+class VTXGraphAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
     def __init__(
@@ -72,7 +72,6 @@ class VTXAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
-        self.is_profiling = model_runner.server_args.vortex_profile
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -84,7 +83,7 @@ class VTXAttnBackend(AttentionBackend):
         assert not self.is_multimodal
         assert kv_indptr_buf is None
         assert kv_last_page_len_buf is None
-        self.num_wrappers = 1
+        self.num_wrappers = 2
         self.dispatch_reason = None
 
         # Qwen2/Qwen3 models require higher flashinfer workspace size
@@ -108,7 +107,7 @@ class VTXAttnBackend(AttentionBackend):
         
         self.num_qo_heads = model_runner.model_config.num_attention_heads // get_attention_tp_size()
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(get_attention_tp_size())
-        self.num_attn_groups = self.num_qo_heads // self.num_kv_heads
+        self.group_size = self.num_qo_heads // self.num_kv_heads
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -116,63 +115,118 @@ class VTXAttnBackend(AttentionBackend):
         assert self.q_data_type == torch.bfloat16
         assert self.data_type == torch.bfloat16
         
+        # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.page_size = model_runner.server_args.page_size
-        self.layers_skip =  model_runner.server_args.vortex_layers_skip
-        
-        
-        self.kv_indptr_prefill = torch.zeros(
-                    (max_bs * self.num_kv_heads + 1,), dtype=torch.int32, device=model_runner.device
-                )
-        
-        self.kv_indptr_decode = [
-                torch.zeros(
-                    (max_bs * self.num_kv_heads + 1,), dtype=torch.int32, device=model_runner.device
-                ),
-                torch.zeros(
-                    (max_bs * self.num_kv_heads + 1,), dtype=torch.int32, device=model_runner.device
-                ),
-            ]
-        
-        
-        self.kv_indices_prefill = torch.zeros(
-                    (
-                        (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1) // self.page_size,), 
-                        dtype=torch.int32, device=model_runner.device
-                )
-        
-        self.kv_indices_decode = [
-                torch.zeros(
-                    (
-                        (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1) // self.page_size,), 
-                        dtype=torch.int32, device=model_runner.device
-                ),
-                torch.zeros(
-                    (
-                        (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1) // self.page_size,), 
-                        dtype=torch.int32, device=model_runner.device
-                ),
-            ]
-        
-        
-        self.kv_last_page_len_prefill = torch.ones(
-                (max_bs * self.num_kv_heads,), dtype=torch.int32, device=model_runner.device
-            )
-        
-        self.kv_last_page_len_decode = torch.ones(
-                (max_bs * self.num_kv_heads,), dtype=torch.int32, device=model_runner.device
-            )
-    
-        
-        self.qo_indptr = [
-                torch.zeros(
-                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
-                ),
-                torch.zeros(
-                    (max_bs * self.num_kv_heads + 1,), dtype=torch.int32, device=model_runner.device
-                ),
-            ]
+        self.layers_skip = model_runner.server_args.vortex_layers_skip
 
+        # ===========================
+        # Prefill KV-indptr buffers
+        # ===========================
+
+        self.kv_indptr_prefill = torch.zeros(
+            (max_bs * self.num_kv_heads + 1,),
+            dtype=torch.int32,
+            device=model_runner.device
+        )
+
+        # ===========================
+        # Decode KV-indptr buffers
+        # ===========================
+
+        self.kv_indptr_decode = [
+            torch.zeros(
+                (max_bs * self.num_kv_heads + 1,),
+                dtype=torch.int32,
+                device=model_runner.device
+            ),
+            torch.zeros(
+                (max_bs * self.num_kv_heads + 1,),
+                dtype=torch.int32,
+                device=model_runner.device
+            ),
+        ]
+
+        # ===========================
+        # KV indices (prefill)
+        # ===========================
+
+        self.kv_indices_prefill = torch.zeros(
+            (
+                (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1)
+                // self.page_size,
+            ),
+            dtype=torch.int32,
+            device=model_runner.device
+        )
+
+        # ===========================
+        # KV indices (decode)
+        # ===========================
+
+        self.kv_indices_decode = [
+            torch.zeros(
+                (
+                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1)
+                    // self.page_size,
+                ),
+                dtype=torch.int32,
+                device=model_runner.device
+            ),
+            torch.zeros(
+                (
+                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1)
+                    // self.page_size,
+                ),
+                dtype=torch.int32,
+                device=model_runner.device
+            ),
+        ]
+
+        # ===========================
+        # KV last page length tracking
+        # ===========================
+
+        self.kv_last_page_len_prefill = torch.ones(
+            (max_bs * self.num_kv_heads,),
+            dtype=torch.int32,
+            device=model_runner.device
+        )
+
+        self.kv_last_page_len_decode = torch.ones(
+            (max_bs * self.num_kv_heads,),
+            dtype=torch.int32,
+            device=model_runner.device
+        )
+
+        # ===========================
+        # Query/Output indptr buffers
+        # ===========================
+
+        self.qo_indptr = [
+            torch.zeros(
+                (max_bs + 1,),
+                dtype=torch.int32,
+                device=model_runner.device
+            ),
+            torch.zeros(
+                (max_bs * self.num_kv_heads + 1,),
+                dtype=torch.int32,
+                device=model_runner.device
+            ),
+        ]
+
+        # ===========================
+        # Batch table (token-level mapping)
+        # ===========================
+
+        self.batch_table = torch.zeros(
+            (model_runner.server_args.max_prefill_tokens,),
+            dtype=torch.uint16,
+            device=model_runner.device
+        )
+
+        
         fmha_backend = "auto"
         if is_sm100_supported():
             fmha_backend = "cutlass"
@@ -191,65 +245,86 @@ class VTXAttnBackend(AttentionBackend):
                     self.workspace_buffer,
                     "NHD",
                     use_tensor_cores=self.decode_use_tensor_cores,
-                )
+                ),
+            BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                ),
         ]
         
-        self.min_chunk_size = 8
-        self.max_chunk_size = 32
-        max_seq_lengths = model_runner.model_config.context_len
-        
-        maximum_num_pages =  (max_bs * max_seq_lengths * self.num_kv_heads // self.page_size) + max_bs * self.num_kv_heads
-        maximum_num_workloads = (maximum_num_pages // self.min_chunk_size) + max_bs * self.num_kv_heads
-
-        
-        self.winfo_q_indices = torch.zeros(
-            (maximum_num_workloads,), dtype=torch.int32, device=model_runner.device)
-        
-        self.winfo_kv_offsets = torch.zeros(
-            (maximum_num_workloads,), dtype=torch.int32, device=model_runner.device)
-        
-        self.winfo_kv_lens = torch.zeros(
-            (maximum_num_workloads,), dtype=torch.int32, device=model_runner.device)
-        
-        self.winfo_num_workloads = torch.zeros(
-            (1,), dtype=torch.int32, device=model_runner.device)
-        
-        self.winfo_chunk_size = torch.zeros(
-            (1,), dtype=torch.int32, device=model_runner.device)
-        
-        self.buffer = torch.zeros(
-            (maximum_num_pages,), dtype=torch.float32, device=model_runner.device
-        )
-        
-        self.num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-        
-        self.vtx_api = SparseAttentionServer(
-                head_dim=self.head_dim,
-                num_kv_heads=self.num_kv_heads,
-                num_qo_heads=self.num_qo_heads,
-                page_size=model_runner.server_args.page_size,
-                max_batch_size=max_bs,
-                max_seq_lengths=model_runner.model_config.context_len,
-                max_prefill_lengths=model_runner.server_args.max_prefill_tokens,
-                max_num_tokens=model_runner.max_total_num_tokens,
-                min_chunk_size=self.min_chunk_size,
-                max_chunk_size=self.max_chunk_size,
-                num_selected_pages=model_runner.server_args.vortex_num_selected_pages,
-                page_reserved_bos=model_runner.server_args.vortex_page_reserved_bos, 
-                page_reserved_eos=model_runner.server_args.vortex_page_reserved_eos,
-                max_num_pages_per_request=(model_runner.model_config.context_len + model_runner.server_args.page_size - 1) \
-                    // model_runner.server_args.page_size if model_runner.server_args.vortex_max_seq_lens < 0 \
-                        else (model_runner.server_args.vortex_max_seq_lens + model_runner.server_args.page_size - 1) \
-                            // model_runner.server_args.page_size,
-                algo_name=model_runner.server_args.vortex_sparse_attention_algorithm
-        )
-        
-        
+        self.sparse_attention = model_runner.sparse_attention
+        self.ctx = vortex_torch.indexer.Context()
+        self._initialize_graph(model_runner)
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata: Dict[int, List[BatchDecodeWithPagedKVCacheWrapper]] = {}
         self.plan_graph: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph]]
+    
+
+    def _initialize_graph(self, model_runner: "ModelRunner") -> None:
+        """
+        Initialize execution context and warm up kernels/graphs with minimal dummy tensors.
+
+        Expectations:
+            - self.head_dim: int > 0
+            - self.ctx: provides create / assert_created / profile / summary / execute
+            - self.sparse_attention.forward_indexer is callable
+            - model_runner.device is a valid torch.device
+        """
+        # ---- Basic validations ----
+        if getattr(self, "ctx", None) is None:
+            raise RuntimeError("`self.ctx` is not set. Please construct/inject a context before initialize().")
+
+        if not hasattr(self, "head_dim") or not isinstance(self.head_dim, int) or self.head_dim <= 0:
+            raise AttributeError("`self.head_dim` must be a positive integer.")
+
+        device: Optional[torch.device] = getattr(model_runner, "device", None)
+        if device is None:
+            raise AttributeError("`model_runner.device` is required but missing.")
+
+        indexer = getattr(getattr(self, "sparse_attention", None), "forward_indexer", None)
+        if indexer is None or not callable(indexer):
+            raise AttributeError("`self.sparse_attention.forward_indexer` is missing or not callable.")
+
+        # ---- Context lifecycle ----
+        self.ctx.create(self, model_runner)
+        self.ctx.assert_created()
+        self.ctx.profile()  # enter 'profile' mode during warm-up
+
+        # ---- Minimal warm-up tensors (placeholders only) ----
+        dtype = torch.bfloat16
+
+        try:
+            with torch.no_grad():
+                # Dummy placeholders: used only for kernel / graph warm-up
+                q_dummy = as_vtensor(torch.empty((1, self.group_size, self.head_dim), device=device, dtype=dtype), FORMAT.BATCHED)
+                o_dummy = as_vtensor(torch.empty((0, 1, 1), device=device, dtype=dtype), FORMAT.RAGGED)
+                cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
+                
+                cache_dummy = {
+                        cache_name:  as_vtensor(torch.zeros(
+                                (0, cache_shape[0], cache_shape[1]),
+                                dtype=dtype,
+                                device=device,
+                            ), FORMAT.PAGED)
+                        
+                        for (cache_name, cache_shape) in cache_meta_info.items()
+                    }
+                
+                indexer(q_dummy, o_dummy, cache_dummy, ctx=self.ctx)
+
+
+        except Exception:
+            raise
+
         
+        self.ctx.summary()
+        self.ctx.execute()
+
+
+
+    
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         
         assert not forward_batch.forward_mode.is_draft_extend()
@@ -258,28 +333,18 @@ class VTXAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             
             bs = len(forward_batch.req_pool_indices)
-            
-            self.vtx_api.plan_decode(
-                    cached_seq_lens=forward_batch.seq_lens.to(torch.int32),
-                    dense_kv_indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads+1],
-                    dense_kv_indices=self.kv_indices_decode[0],
-                    sparse_kv_indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads+1],
-                    sparse_kv_indices=self.kv_indices_decode[1],
-                    kv_last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
-                    req_to_token=self.req_to_token,
-                    req_indices=forward_batch.req_pool_indices,
-                    winfo_q_indices=self.winfo_q_indices,
-                    winfo_kv_offsets=self.winfo_kv_offsets,
-                    winfo_kv_lens=self.winfo_kv_lens,
-                    winfo_num_workload=self.winfo_num_workloads,
-                    winfo_chunk_size=self.winfo_chunk_size
+            vortex_torch.indexer.utils_sglang.plan_decode(
+                cached_seq_lens=forward_batch.seq_lens.to(torch.int32),
+                req_to_token=self.req_to_token,
+                req_indices=forward_batch.req_pool_indices,
+                ctx=self.ctx
             )
             
             self.decode_wrappers[0].plan(
                 indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads+1],
                 indices=self.kv_indices_decode[0],
                 last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
-                num_qo_heads=self.num_attn_groups,
+                num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
                 page_size=self.page_size,
@@ -287,7 +352,18 @@ class VTXAttnBackend(AttentionBackend):
                 kv_data_type=self.data_type,
             )
             
-            self.forward_metadata = DecodeMetadata([self.decode_wrappers[0]])
+            self.decode_wrappers[1].plan(
+                indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads+1],
+                indices=self.kv_indices_decode[1],
+                last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+                num_qo_heads=self.group_size,
+                num_kv_heads=1,
+                head_dim=self.head_dim,
+                page_size=self.page_size,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+            )
+            self.forward_metadata = DecodeMetadata([self.decode_wrappers[0], self.decode_wrappers[1]])
         
         elif forward_batch.forward_mode.is_extend():
             
@@ -295,7 +371,7 @@ class VTXAttnBackend(AttentionBackend):
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             bs = len(forward_batch.req_pool_indices)
             
-            self.vtx_api.plan_prefill(
+            vortex_torch.indexer.utils_sglang.plan_prefill(
                 cached_seq_lens=prefix_lens,
                 dense_kv_indptr=self.kv_indptr_prefill[:bs*self.num_kv_heads+1],
                 dense_kv_indices=self.kv_indices_prefill,
@@ -304,8 +380,12 @@ class VTXAttnBackend(AttentionBackend):
                 qo_indptr_paged=self.qo_indptr[1][:bs*self.num_kv_heads+1],
                 kv_last_page_len=self.kv_last_page_len_prefill[:bs*self.num_kv_heads],
                 req_to_token=self.req_to_token,
-                req_indices=forward_batch.req_pool_indices
+                req_indices=forward_batch.req_pool_indices,
+                batch_table=self.batch_table,
+                page_size=self.page_size,
+                num_kv_heads=self.num_kv_heads
             )
+            
    
             self.prefill_wrapper_ragged.plan(
                 self.qo_indptr[0][:bs+1],
@@ -321,7 +401,7 @@ class VTXAttnBackend(AttentionBackend):
                 self.kv_indptr_prefill[:bs*self.num_kv_heads+1],
                 self.kv_indices_prefill,
                 self.kv_last_page_len_prefill[:bs*self.num_kv_heads],
-                self.num_attn_groups,
+                self.group_size,
                 1,
                 self.head_dim,
                 self.page_size,
@@ -376,30 +456,33 @@ class VTXAttnBackend(AttentionBackend):
                             :bs*self.num_kv_heads
                         ],
                     ),
-                    
+                
+                BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                        paged_kv_indptr_buffer=self.kv_indptr_decode[1][:bs*self.num_kv_heads + 1],
+                        paged_kv_indices_buffer=self.kv_indices_decode[1],
+                        paged_kv_last_page_len_buffer=self.kv_last_page_len_decode[
+                            :bs*self.num_kv_heads
+                        ],
+                    ),
+                
             ]
-            
-            self.vtx_api.plan_decode(
-                    cached_seq_lens=seq_lens.to(torch.int32),
-                    dense_kv_indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads + 1],
-                    dense_kv_indices=self.kv_indices_decode[0],
-                    sparse_kv_indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads + 1],
-                    sparse_kv_indices=self.kv_indices_decode[1],
-                    kv_last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
-                    req_to_token=self.req_to_token,
-                    req_indices=req_pool_indices,
-                    winfo_q_indices=self.winfo_q_indices,
-                    winfo_kv_offsets=self.winfo_kv_offsets,
-                    winfo_kv_lens=self.winfo_kv_lens,
-                    winfo_num_workload=self.winfo_num_workloads,
-                    winfo_chunk_size=self.winfo_chunk_size
+
+            vortex_torch.indexer.utils_sglang.plan_decode(
+                cached_seq_lens=seq_lens.to(torch.int32),
+                req_to_token=self.req_to_token,
+                req_indices=req_pool_indices,
+                ctx=self.ctx
             )
             
             decode_wrappers[0].plan(
                 indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads+1],
                 indices=self.kv_indices_decode[0],
                 last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
-                num_qo_heads=self.num_attn_groups,
+                num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
                 page_size=self.page_size,
@@ -407,7 +490,18 @@ class VTXAttnBackend(AttentionBackend):
                 kv_data_type=self.data_type,
             )
             
-
+            decode_wrappers[1].plan(
+                indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads+1],
+                indices=self.kv_indices_decode[1],
+                last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+                num_qo_heads=self.group_size,
+                num_kv_heads=1,
+                head_dim=self.head_dim,
+                page_size=self.page_size,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+            )
+            
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)             
         else:
@@ -427,27 +521,18 @@ class VTXAttnBackend(AttentionBackend):
     ):
         assert forward_mode.is_decode_or_idle()
         
+        vortex_torch.indexer.utils_sglang.plan_decode(
+                cached_seq_lens=seq_lens.to(torch.int32),
+                req_to_token=self.req_to_token,
+                req_indices=req_pool_indices,
+                ctx=self.ctx
+            )
         
-        self.vtx_api.plan_decode(
-            cached_seq_lens=seq_lens.to(torch.int32),
-            dense_kv_indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads + 1],
-            dense_kv_indices=self.kv_indices_decode[0],
-            sparse_kv_indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads + 1],
-            sparse_kv_indices=self.kv_indices_decode[1],
-            kv_last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
-            req_to_token=self.req_to_token,
-            req_indices=req_pool_indices,
-            winfo_q_indices=self.winfo_q_indices,
-            winfo_kv_offsets=self.winfo_kv_offsets,
-            winfo_kv_lens=self.winfo_kv_lens,
-            winfo_num_workload=self.winfo_num_workloads,
-            winfo_chunk_size=self.winfo_chunk_size
-        )
         self.decode_cuda_graph_metadata[bs][0].plan(
             indptr=self.kv_indptr_decode[0][:bs*self.num_kv_heads+1],
             indices=self.kv_indices_decode[0],
             last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
-            num_qo_heads=self.num_attn_groups,
+            num_qo_heads=self.group_size,
             num_kv_heads=1,
             head_dim=self.head_dim,
             page_size=self.page_size,
@@ -455,6 +540,17 @@ class VTXAttnBackend(AttentionBackend):
             kv_data_type=self.data_type,
         )
         
+        self.decode_cuda_graph_metadata[bs][1].plan(
+            indptr=self.kv_indptr_decode[1][:bs*self.num_kv_heads+1],
+            indices=self.kv_indices_decode[1],
+            last_page_len=self.kv_last_page_len_decode[:bs*self.num_kv_heads],
+            num_qo_heads=self.group_size,
+            num_kv_heads=1,
+            head_dim=self.head_dim,
+            page_size=self.page_size,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         
@@ -470,7 +566,7 @@ class VTXAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         
-        assert isinstance(forward_batch.token_to_kv_pool, VTXTokenToKVPool)
+        assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
         
@@ -498,9 +594,13 @@ class VTXAttnBackend(AttentionBackend):
                 logits_soft_cap=logits_soft_cap,
                 )
             
-            q_t = self.vtx_api.chunkwise_NH2HN_transpose(
+            q_t = vortex_torch.indexer.utils_sglang.chunkwise_nh2hn_transpose(
                 q.view(-1, self.num_qo_heads, self.head_dim),
-                self.qo_indptr[0]
+                self.qo_indptr[0],
+                self.batch_table,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim
             )
             
             
@@ -514,8 +614,13 @@ class VTXAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
                 )
-            o2_t, s2_t = self.vtx_api.chunkwise_HN2NH_transpose(
-                o2, s2, self.qo_indptr[0]
+            o2_t, s2_t = vortex_torch.indexer.utils_sglang.chunkwise_hn2nh_transpose(
+                o2,  s2, 
+                self.qo_indptr[0], 
+                self.batch_table,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim
             )
             
             o, _ = merge_state(o1, s1, o2_t, s2_t)
@@ -535,65 +640,66 @@ class VTXAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-    ):  
+    ):
+        """
+        Decode-time forward pass with optional sparse attention.
+        Expects KV to be sourced from token_to_kv_pool; can also save new KV.
+        """
 
-        assert isinstance(forward_batch.token_to_kv_pool, VTXTokenToKVPool)
+        # Sanity checks and setup
+        assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
-        
+
+        # Optionally write incoming K/V to decode cache
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer_decode(
+                forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-        k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        # Read Cache from memory pool
+        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
         
+        cache_k = cache["k"].view(-1, self.page_size, 1, self.head_dim)
+        cache_v = cache["v"].view(-1, self.page_size, 1, self.head_dim)
+        
+        # Decide whether to use sparsity on this layer
         use_sparsity = (layer.layer_id not in self.layers_skip)
-        
+
         if use_sparsity:
-            q = q.view(-1, self.num_attn_groups, layer.head_dim).contiguous()
-            landmarks = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
-            
-            
-            broadcast_mv(
-                q, landmarks, self.buffer, self.kv_indices_decode[0],
-                self.winfo_q_indices, self.winfo_kv_offsets,
-                self.winfo_kv_lens, self.winfo_num_workloads, 
-                self.max_chunk_size, self.num_attn_groups, self.head_dim, self.num_sms
+            # Prepare Q in grouped shape expected by sparse path
+            q = q.view(-1, self.group_size, layer.head_dim).contiguous()
+
+            # Build sparse indices into paged KV buffers
+            self.sparse_attention.forward_indexer(
+                q=q,
+                o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
+                cache=cache,
+                ctx=self.ctx
             )
-            
-            
-            self.vtx_api.topk_output(
-                 score=self.buffer,
-                 dense_kv_indptr=self.kv_indptr_decode[0],
-                 dense_kv_indices=self.kv_indices_decode[0],
-                 sparse_kv_indptr=self.kv_indptr_decode[1],
-                 sparse_kv_indices=self.kv_indices_decode[1],
-                 eff_batch_size=q.shape[0]
+
+            # Sparse attention compute
+            o = self.forward_metadata.decode_wrappers[1].forward(
+                q,
+                (cache_k, cache_v),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
             )
-            
-            o = attention_decode(
-                q, k, v, self.kv_indptr_decode[1], 
-                self.kv_indices_decode[1],
-                self.kv_last_page_len_decode,
-                self.page_size
-            )
-           
 
         else:
+            # Dense attention path
             o = self.forward_metadata.decode_wrappers[0].forward(
-                    q.contiguous().view(-1, self.num_attn_groups, layer.head_dim),
-                    (k, v),
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=layer.logit_cap,
-                    k_scale=layer.k_scale,
-                    v_scale=layer.v_scale,
-                )
-        
+                q.contiguous().view(-1, self.group_size, layer.head_dim),
+                (cache_k, cache_v),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+            )
+
+        # Restore to merged head dimension
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
-    
-    
-    def _get_wrapper_idx(self, layer: RadixAttention):
-        
-        return 0 if layer.layer_id in self.layers_skip else 1

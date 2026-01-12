@@ -89,7 +89,7 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 
-from sglang.srt.mem_cache.vtx_memory_pool import VTXTokenToKVPool
+from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
 from sglang.srt.mem_cache.cpu_vtx_memory_pool import CPUVTXTokenToKVPool
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -244,6 +244,13 @@ class ModelRunner:
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
 
+        self.sparse_attention = None
+        if self.server_args.enable_vortex_sparsity:
+            import vortex_torch
+            self.sparse_attention = vortex_torch.flow.build_vflow(
+                self.server_args.vortex_module_name,
+                user_file=self.server_args.vortex_module_path
+            )
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -1068,21 +1075,16 @@ class ModelRunner:
         else:
             self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
-        # if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
-        #     max_num_reqs = min(
-        #         self.max_total_num_tokens // self.model_config.context_len, 256)
-        # else:
-        max_num_reqs = min(
-            max(
-                int(
-                    self.max_total_num_tokens
-                    / self.model_config.context_len
-                    * 512
+        if max_num_reqs is None:
+            max_num_reqs = min(
+                max(
+                    int(
+                        self.max_total_num_tokens / self.model_config.context_len * 512
+                    ),
+                    2048,
                 ),
-                2048,
-            ),
-            4096 if not self.server_args.enable_vortex_sparsity else 256,
-        )
+                4096 if not self.server_args.enable_vortex_sparsity else 1024,
+            )
             
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
@@ -1264,20 +1266,24 @@ class ModelRunner:
                     context_len=self.model_config.context_len,
                 )
             elif self.server_args.enable_vortex_sparsity:
-                self.token_to_kv_pool = VTXTokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                )
+                    
+                    self.token_to_kv_pool = VTXGraphCachePool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        sparse_attention=self.sparse_attention,
+                        model_runner=self,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
+                
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
@@ -1368,18 +1374,14 @@ class ModelRunner:
                 return CPUVTXCGAttnBackend(self)
         elif self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
-                if not self.server_args.vortex_cg:
-                    from sglang.srt.layers.attention.vtx_flashinfer_backend import (
-                        VTXFlashInferAttnBackend,
-                    )
-    
-                    return VTXFlashInferAttnBackend(self)
-                else:
-                    from sglang.srt.layers.attention.vtx_cg_backend import (
-                        VTXCGAttnBackend,
-                    )
+                
+                from sglang.srt.layers.attention.vtx_graph_backend import (
+                        VTXGraphAttnBackend,
+                )
                     
-                    return VTXCGAttnBackend(self)
+                return VTXGraphAttnBackend(self)
+                
+                
             elif not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
@@ -1435,11 +1437,17 @@ class ModelRunner:
                 "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
                 "Please use `--attention-backend flashinfer`."
             )
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
+            if self.server_args.enable_vortex_sparsity:
+                from sglang.srt.layers.attention.vtx_fa3_backend import (
+                    VTXFA3AttnBackend
+                )
+                return VTXFA3AttnBackend(self)
+            else:
+                from sglang.srt.layers.attention.flashattention_backend import (
+                    FlashAttentionBackend,
+                )
 
-            return FlashAttentionBackend(self)
+                return FlashAttentionBackend(self)
         elif self.server_args.attention_backend == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
