@@ -52,8 +52,8 @@ def main():
                     disable_cuda_graph=False,
                     page_size=16,
                     mem_fraction_static=0.8,
-                    cpu_mem_fraction=0.6,
-                    vortex_num_selected_pages=62,
+                    cpu_mem_fraction=0.7,
+                    vortex_topk_val=30,
                     disable_overlap_schedule=True,
                     attention_backend="cpu_vtx_flashinfer",
                     enable_vortex_sparsity=True,
@@ -61,8 +61,8 @@ def main():
                     vortex_page_reserved_eos=1,
                     vortex_layers_skip=[],
                     enable_cpu_vtx_cache=True,
-                    vortex_cg=True,
-                    kv_cache_dtype="auto",
+                    vortex_module_name="block_sparse_attention",
+                    vortex_max_seq_lens=8192,
                     )
     
     dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")

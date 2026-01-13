@@ -15,6 +15,8 @@ from sglang.srt.mem_cache.cpu_gpu_copy_kernels import (
     update_landmark_from_cpu,
     naive_copy,
 )
+import vortex_torch
+from vortex_torch.abs import as_vtensor, FORMAT
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -197,6 +199,18 @@ class CPUVTXTokenToKVPool(KVCache):
 
     def get_landmark_buffer(self, layer_id: int):
         return self.landmark_buffer[layer_id - self.start_layer]
+
+    def get_cache(self, layer_id: int):
+        """Return cache dictionary for sparse attention indexer."""
+        k_buffer = self.get_key_buffer(layer_id)
+        v_buffer = self.get_value_buffer(layer_id)
+        centroids = self.get_landmark_buffer(layer_id)
+
+        return {
+            "k": as_vtensor(k_buffer, FORMAT.PAGED),
+            "v": as_vtensor(v_buffer, FORMAT.PAGED),
+            "centroids": as_vtensor(centroids, FORMAT.PLAIN),
+        }
 
     def set_kv_buffer(
         self,

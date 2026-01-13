@@ -977,16 +977,13 @@ class ModelRunner:
 
                 # Get CPU memory based on cpu_mem_fraction
                 import psutil
-                total_cpu_memory = psutil.virtual_memory().total
+                total_cpu_memory = psutil.virtual_memory().available
                 usable_cpu_memory = int(total_cpu_memory * self.server_args.cpu_mem_fraction)
 
                 # Calculate max tokens and batch size from CPU memory
                 max_tokens_from_cpu = usable_cpu_memory // cell_size
                 available_gpu_memory = rest_gpu_memory * (1 << 30) - (max_tokens_from_cpu // self.server_args.page_size) * (cell_size / 2)
                 max_tokens_from_gpu = int(available_gpu_memory // cell_size)
-                
-                print(max_tokens_from_cpu)
-                print(max_tokens_from_gpu)
 
                 return (max_tokens_from_cpu, max_tokens_from_gpu)
             else:
@@ -1074,6 +1071,7 @@ class ModelRunner:
             self.max_total_num_tokens_gpu = max_total_num_tokens_gpu
         else:
             self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+            self.max_total_num_tokens_gpu = None
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -1243,11 +1241,27 @@ class ModelRunner:
                     device=self.device,
                 )
             elif self.server_args.attention_backend == "cpu_vtx_flashinfer":
-                # CPU-based KV cache for Vortex sparse attention
-                from sglang.srt.mem_cache.cpu_vtx_memory_pool_cached import CPUVTXTokenToKVPoolCached
-                self.token_to_kv_pool = CPUVTXTokenToKVPoolCached(
+                from sglang.srt.mem_cache.cpu_vtx_graph_memory_pool import CPUVTXGraphTokenToKVPool
+                self.token_to_kv_pool = CPUVTXGraphTokenToKVPool(
+                    size=self.max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    page_size=self.page_size,
+                    gpu_size=self.max_total_num_tokens_gpu,
+                    sparse_attention=self.sparse_attention,
+                    memory_saver_adapter=self.memory_saver_adapter,
+                    model_runner=self,
+                    enable_custom_mem_pool=False,
+                )
+            elif self.server_args.enable_vortex_sparsity:
+                    
+                self.token_to_kv_pool = VTXGraphCachePool(
                     self.max_total_num_tokens,
-                    self.max_total_num_tokens_gpu,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
@@ -1257,32 +1271,11 @@ class ModelRunner:
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    sparse_attention=self.sparse_attention,
+                    model_runner=self,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
-                    layer_skips=self.server_args.vortex_layers_skip,
-                    vortex_num_selected_pages=self.server_args.vortex_num_selected_pages,
-                    vortex_page_reserved_bos=self.server_args.vortex_page_reserved_bos,
-                    vortex_page_reserved_eos=self.server_args.vortex_page_reserved_eos,
-                    context_len=self.model_config.context_len,
                 )
-            elif self.server_args.enable_vortex_sparsity:
-                    
-                    self.token_to_kv_pool = VTXGraphCachePool(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        sparse_attention=self.sparse_attention,
-                        model_runner=self,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                    )
                 
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
@@ -1362,16 +1355,16 @@ class ModelRunner:
     def _get_attention_backend(self):
         if self.server_args.attention_backend == "cpu_vtx_flashinfer":
             # CPU-based KV cache with Vortex sparse attention
-            if not self.server_args.vortex_cg:
-                from sglang.srt.layers.attention.cpu_vtx_flashinfer_backend import (
-                    CPUVTXFlashInferAttnBackend,
-                )
-                return CPUVTXFlashInferAttnBackend(self)
-            else:
-                from sglang.srt.layers.attention.cpu_vtx_cg_backend import (
-                    CPUVTXCGAttnBackend,
-                )
-                return CPUVTXCGAttnBackend(self)
+            # if not self.server_args.vortex_cg:
+            #     from sglang.srt.layers.attention.cpu_vtx_flashinfer_backend import (
+            #         CPUVTXFlashInferAttnBackend,
+            #     )
+            #     return CPUVTXFlashInferAttnBackend(self)
+            # else:
+            from sglang.srt.layers.attention.cpu_vtx_cg_backend import (
+                CPUVTXCGAttnBackend,
+            )
+            return CPUVTXCGAttnBackend(self)
         elif self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
                 
