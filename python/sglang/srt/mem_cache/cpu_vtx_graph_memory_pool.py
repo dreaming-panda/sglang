@@ -9,15 +9,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.utils import is_cuda
-from sglang.srt.mem_cache.cpu_gpu_copy_kernels import (
-    update_landmark_from_cpu,
-    store_kv_cpu_and_gpu,
-)
 
 import vortex_torch
 from vortex_torch.abs import as_vtensor, FORMAT
 from vortex_torch.cache.unified_view import UnifiedCacheView
-import vortex_C
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -86,18 +81,32 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         self.num_pages_gpu = ((self.gpu_size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
 
         self.cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
-        self.cache_cpu = [
-            {
-                cache_name: torch.zeros(
-                    (self.num_pages, cache_shape[0], cache_shape[1]),
-                    dtype=self.store_dtype,
-                    device='cpu',
-                    pin_memory=True,
-                )
-                for (cache_name, cache_shape) in self.cache_meta_info.items()
-            }
-            for _ in range(self.layer_num)
-        ]
+        # self.cache_cpu = [
+        #     {
+        #         cache_name: torch.zeros(
+        #             (self.num_pages, cache_shape[0], cache_shape[1]),
+        #             dtype=self.store_dtype,
+        #             device='cpu',
+        #             pin_memory=True,
+        #         )
+        #         for (cache_name, cache_shape) in self.cache_meta_info.items()
+        #     }
+        #     for _ in range(self.layer_num)
+        # ]
+        
+        self.cache_cpu = []
+        
+        for _ in range(self.layer_num):
+            temp = {}
+            for (cache_name, cache_shape) in self.cache_meta_info.items():
+                if cache_name in ["k", "v"]:
+                    temp[cache_name] = torch.zeros(
+                        (self.num_pages, cache_shape[0], cache_shape[1]),
+                        dtype=self.store_dtype,
+                        device='cpu',
+                        pin_memory=True,
+                    )
+            self.cache_cpu.append(temp)
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.cache_staging = [
@@ -249,7 +258,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         else:
             dst_staging_slots = dst_kv_indices
 
-        vortex_C.copy_sparse_kv_to_gpu_with_indptr(
+        vortex_torch.cache.copy_sparse_kv_to_gpu_with_indptr(
             cpu_k_buffer=cpu_k,
             cpu_v_buffer=cpu_v,
             gpu_k_buffer=gpu_k,
@@ -293,7 +302,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         gpu_v_staging = self.cache_staging[layer_idx]["v"]
         cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[layer_idx]
 
-        store_kv_cpu_and_gpu(
+        vortex_torch.cache.store_kv_cpu_and_gpu(
             cpu_k_buffer,
             cpu_v_buffer,
             gpu_k_staging,
@@ -306,7 +315,21 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             self.max_page_id,
         )
         
-        self.sparse_attention.forward_cache(self.cache_cpu[layer_id - self.start_layer], loc, ctx=self.ctx)
+        unified_cache = {
+            "k": UnifiedCacheView(
+                cpu_k_buffer,
+                gpu_k_staging,
+                cpu_to_gpu_map
+            ),
+            "v": UnifiedCacheView(
+                cpu_v_buffer,
+                gpu_v_staging,
+                cpu_to_gpu_map
+            ),
+            "centroids": self.cache_staging[layer_idx]["centroids"]
+        }
+        
+        self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
 
     def set_kv_buffer_decode(
         self,
@@ -359,7 +382,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
                 gpu_v_staging,
                 cpu_to_gpu_map
             ),
-            "centroids": self.cache_cpu[layer_idx]["centroids"]
+            "centroids": self.cache_staging[layer_idx]["centroids"]
         }
         
         self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)

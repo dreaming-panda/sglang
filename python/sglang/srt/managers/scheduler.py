@@ -377,8 +377,6 @@ class Scheduler(
             global_server_args_dict["max_micro_batch_size"] = max(
                 self.max_running_requests // server_args.pp_size, 1
             )
-            
-        print(global_server_args_dict["max_micro_batch_size"])
 
         self.tp_group = self.tp_worker.get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group

@@ -1,17 +1,5 @@
 from __future__ import annotations
 
-"""
-CPU-based Vortex FlashInfer Attention Backend with CUDA Graph Support.
-
-This backend stores KV cache on CPU and only transfers sparse pages to GPU during decode.
-Supports CUDA graph capture and replay for efficient decoding.
-
-Key features:
-1. KV cache stored on CPU (via CPUVTXTokenToKVPool)
-2. CUDA graph compatible decode path
-3. Sparse attention with CPU->GPU transfer via GPU kernel (not cudaMemcpy)
-"""
-
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
@@ -32,7 +20,6 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.mem_cache.cpu_vtx_memory_pool import CPUVTXTokenToKVPool
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -700,8 +687,6 @@ class CPUVTXCGAttnBackend(AttentionBackend):
             )
 
             k_staging, v_staging, _ = result
-            # k_staging = k_staging.view(-1, self.page_size, 1, self.head_dim)
-            # v_staging = v_staging.view(-1, self.page_size, 1, self.head_dim)
             
             o = self.forward_metadata.decode_wrappers[1].forward(
                 q, (k_staging, v_staging),
@@ -713,25 +698,16 @@ class CPUVTXCGAttnBackend(AttentionBackend):
 
         else:
             # Dense attention path (for skipped layers)
-            # Copy all KV from CPU to GPU staging buffer
-            result = forward_batch.token_to_kv_pool.copy_sparse_kv_to_gpu(
-                layer_id=layer.layer_id,
-                sparse_kv_indices=self.kv_indices_decode[0],
-                sparse_kv_indptr=self.kv_indptr_decode[0],
-                batch_size=bs,
-            )
-
-            k_staging, v_staging, staging_kv_indices = result
-            # Staging buffers are already in paged format [num_pages, page_size, 1, head_dim]
-
-            o = self.forward_metadata.decode_wrappers[0].forward(
-                q.contiguous().view(-1, self.group_size, layer.head_dim),
-                (k_staging, v_staging),
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-            )
+            # o = self.forward_metadata.decode_wrappers[0].forward(
+            #     q.contiguous().view(-1, self.group_size, layer.head_dim),
+            #     (k_staging, v_staging),
+            #     sm_scale=layer.scaling,
+            #     logits_soft_cap=layer.logit_cap,
+            #     k_scale=layer.k_scale,
+            #     v_scale=layer.v_scale,
+            # )
+            
+            raise NotImplementedError("Layer skipping not yet implemented for CPU Cache")
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

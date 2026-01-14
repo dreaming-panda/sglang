@@ -7,6 +7,7 @@ import os
 from tqdm import tqdm
 import time
 import torch
+import argparse
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 MATH_QUERY_TEMPLATE = """
 Solve the following math problem efficiently and clearly.  The last line of your response should be of the following format: 'Therefore, the final answer is: $\\boxed{{ANSWER}}$. I hope it is correct' (without quotes) where ANSWER is just the final number or expression that solves the problem. Think step by step before answering.
@@ -43,19 +44,27 @@ def generate_requests(dataset: Dataset, field_name: str, data_format: str, trial
 
     return requests
 
-
-
-
 def main():
-    model_name = "Qwen/Qwen3-14B"
+    parser = argparse.ArgumentParser(description="Run AIME benchmark with SGLang")
+    parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-14B", help="Model name or path")
+    parser.add_argument("--attention-backend", type=str, default="cpu_vtx_flashinfer", help="Attention backend")
+    parser.add_argument("--mem-fraction-static", type=float, default=0.8, help="Static memory fraction")
+    parser.add_argument("--max-new-tokens", type=int, default=128, help="Maximum number of new tokens to generate")
+    args = parser.parse_args()
+
+    model_name = args.model_name
+    attention_backend = args.attention_backend
+    mem_fraction_static = args.mem_fraction_static
+    max_new_tokens = args.max_new_tokens
+
     llm = sgl.Engine(model_path=model_name,
                     disable_cuda_graph=False,
                     page_size=16,
-                    mem_fraction_static=0.8,
+                    mem_fraction_static=mem_fraction_static,
                     cpu_mem_fraction=0.7,
                     vortex_topk_val=30,
                     disable_overlap_schedule=True,
-                    attention_backend="cpu_vtx_flashinfer",
+                    attention_backend=attention_backend,
                     enable_vortex_sparsity=True,
                     vortex_page_reserved_bos=1,
                     vortex_page_reserved_eos=1,
@@ -83,8 +92,8 @@ def main():
         enable_thinking=True
     ) for text in texts
     ] * 8
-    
-    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 128}
+
+    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": max_new_tokens}
     total_tokens = 0
     total_time = 0.0
     start = time.perf_counter()
@@ -92,7 +101,12 @@ def main():
     elapsed = time.perf_counter() - start
     total_time += elapsed
     e2e_time = 0
-    with open(f"DATA/Qwen3-14B/AIME24_VTX_CG_Cache_16K.jsonl", "w", encoding="utf-8") as f:
+
+    # Create output directory
+    output_dir = f"DATA/{model_name}/AIME24"
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(f"{output_dir}/{attention_backend}.jsonl", "w", encoding="utf-8") as f:
         for item in o:
             total_tokens += item["meta_info"]["completion_tokens"] 
             e2e_time = max(e2e_time, item["meta_info"]["e2e_latency"])
