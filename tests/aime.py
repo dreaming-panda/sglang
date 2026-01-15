@@ -53,9 +53,16 @@ def main():
     args = parser.parse_args()
 
     model_name = args.model_name
-    attention_backend = args.attention_backend
+    name = args.attention_backend
     mem_fraction_static = args.mem_fraction_static
     max_new_tokens = args.max_new_tokens
+    enable_vortex_sparsity = True
+    
+    if name not in ["cpu_vtx_flashinfer", "flashinfer"]:
+        enable_vortex_sparsity = False
+        attention_backend = "flashinfer"
+    else:
+        attention_backend = name
 
     llm = sgl.Engine(model_path=model_name,
                     disable_cuda_graph=False,
@@ -65,13 +72,13 @@ def main():
                     vortex_topk_val=30,
                     disable_overlap_schedule=True,
                     attention_backend=attention_backend,
-                    enable_vortex_sparsity=True,
+                    enable_vortex_sparsity=enable_vortex_sparsity,
                     vortex_page_reserved_bos=1,
                     vortex_page_reserved_eos=1,
                     vortex_layers_skip=[],
                     enable_cpu_vtx_cache=True,
                     vortex_module_name="block_sparse_attention",
-                    vortex_max_seq_lens=8192,
+                    vortex_max_seq_lens=-1,
                     )
     
     dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
@@ -103,10 +110,10 @@ def main():
     e2e_time = 0
 
     # Create output directory
-    output_dir = f"DATA/{model_name}/AIME24"
+    output_dir = f"DATA/{model_name}/AIME24/gpu_{mem_fraction_static}/max_tokens_{max_new_tokens}"
     os.makedirs(output_dir, exist_ok=True)
 
-    with open(f"{output_dir}/{attention_backend}.jsonl", "w", encoding="utf-8") as f:
+    with open(f"{output_dir}/{name}.jsonl", "w", encoding="utf-8") as f:
         for item in o:
             total_tokens += item["meta_info"]["completion_tokens"] 
             e2e_time = max(e2e_time, item["meta_info"]["e2e_latency"])

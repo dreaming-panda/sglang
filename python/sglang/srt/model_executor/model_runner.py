@@ -979,10 +979,30 @@ class ModelRunner:
                 total_cpu_memory = psutil.virtual_memory().available
                 usable_cpu_memory = int(total_cpu_memory * self.server_args.cpu_mem_fraction)
 
-                # Calculate max tokens and batch size from CPU memory
+                # Calculate max tokens from CPU memory (hard limit)
                 max_tokens_from_cpu = usable_cpu_memory // cell_size
-                available_gpu_memory = rest_gpu_memory * (1 << 30) - (max_tokens_from_cpu // self.server_args.page_size) * (cell_size / 2)
-                max_tokens_from_gpu = int(available_gpu_memory // cell_size)
+
+                # Calculate max tokens from GPU staging buffer
+                available_gpu_memory_bytes = rest_gpu_memory * (1 << 30)
+                max_tokens_from_gpu_raw = int(available_gpu_memory_bytes // cell_size)
+
+                # For sparse attention, each request uses at most:
+                # (vortex_topk_val + vortex_page_reserved_bos + vortex_page_reserved_eos) * page_size tokens
+                pages_per_request = (
+                    self.server_args.vortex_topk_val
+                    + self.server_args.vortex_page_reserved_bos
+                    + self.server_args.vortex_page_reserved_eos
+                )
+                tokens_per_request_gpu = pages_per_request * self.server_args.page_size
+                max_reqs_from_gpu = max_tokens_from_gpu_raw // tokens_per_request_gpu
+
+                # CPU tokens should not exceed what max_reqs_from_gpu can handle
+                # Each request can use up to context_len tokens on CPU
+                context_len = self.model_config.context_len
+                max_tokens_from_cpu = min(max_tokens_from_cpu, max_reqs_from_gpu * context_len)
+
+                # GPU staging needs to hold active batch sparse pages
+                max_tokens_from_gpu = max_tokens_from_gpu_raw
 
                 return (max_tokens_from_cpu, max_tokens_from_gpu)
             else:

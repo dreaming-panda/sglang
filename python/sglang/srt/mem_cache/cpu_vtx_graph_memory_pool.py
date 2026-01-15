@@ -109,17 +109,18 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             self.cache_cpu.append(temp)
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self.cache_staging = [
-                {
-                    cache_name: torch.zeros(
-                        (self.num_pages_gpu, cache_shape[0], cache_shape[1]),
+            self.cache_staging = []
+            for _ in range(self.layer_num):
+                layer_cache = {}
+                for (cache_name, cache_shape) in self.cache_meta_info.items():
+                    # k and v use GPU staging buffer size; other caches (e.g., centroids) use full CPU size
+                    num_pages_for_cache = self.num_pages_gpu if cache_name in ["k", "v"] else self.num_pages
+                    layer_cache[cache_name] = torch.zeros(
+                        (num_pages_for_cache, cache_shape[0], cache_shape[1]),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for (cache_name, cache_shape) in self.cache_meta_info.items()
-                }
-                for _ in range(self.layer_num)
-            ]
+                self.cache_staging.append(layer_cache)
 
         max_page_id = self.num_pages
         staging_buffer_capacity = self.num_pages_gpu
