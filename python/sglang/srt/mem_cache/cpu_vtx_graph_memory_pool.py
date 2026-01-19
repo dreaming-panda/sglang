@@ -61,6 +61,9 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
 
+        # Enable overflow check only when CUDA graph is disabled
+        self.enable_overflow_check = model_runner.server_args.disable_cuda_graph
+
         cache_size = self.get_cache_size_bytes()
         staging_size = self.get_staging_size_bytes()
 
@@ -281,6 +284,15 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             max_num_pages=self.max_num_pages,
         )
 
+        # Check for staging buffer overflow (only when CUDA graph is disabled)
+        if self.enable_overflow_check and self.temp_overflow_flag.item() != 0:
+            raise RuntimeError(
+                f"GPU staging buffer overflow in copy_sparse_kv_to_gpu_with_indptr. "
+                f"layer_id={layer_id}, batch_size={batch_size}, "
+                f"staging_capacity={self.staging_buffer_capacity}. "
+                f"This indicates max_num_reqs exceeds GPU staging buffer capacity."
+            )
+
         return gpu_k, gpu_v, dst_staging_slots
 
     def set_kv_buffer(
@@ -343,14 +355,14 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
     ):
         """Store KV during decode phase with unified CPU/GPU memory."""
-        
+
         assert layer_id_override is None
         assert k_scale is None
         assert v_scale is None
         assert cache_k.dtype == torch.bfloat16
         assert cache_v.dtype == torch.bfloat16
         assert loc.dtype == torch.int64
-        
+
         layer_id = layer.layer_id
         layer_idx = layer_id - self.start_layer
         
@@ -359,7 +371,6 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         gpu_k_staging = self.cache_staging[layer_idx]["k"]
         gpu_v_staging = self.cache_staging[layer_idx]["v"]
         cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[layer_idx]
-        
         vortex_torch.cache.store_kv_unified(
             cpu_k_buffer,
             cpu_v_buffer,
@@ -371,7 +382,6 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             cpu_to_gpu_map,
             self.page_size,
         )
-        
         unified_cache = {
             "k": UnifiedCacheView(
                 cpu_k_buffer,

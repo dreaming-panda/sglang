@@ -8,6 +8,7 @@ from tqdm import tqdm
 import time
 import torch
 import argparse
+import traceback
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 MATH_QUERY_TEMPLATE = """
 Solve the following math problem efficiently and clearly.  The last line of your response should be of the following format: 'Therefore, the final answer is: $\\boxed{{ANSWER}}$. I hope it is correct' (without quotes) where ANSWER is just the final number or expression that solves the problem. Think step by step before answering.
@@ -49,7 +50,7 @@ def main():
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-14B", help="Model name or path")
     parser.add_argument("--attention-backend", type=str, default="cpu_vtx_flashinfer", help="Attention backend")
     parser.add_argument("--mem-fraction-static", type=float, default=0.8, help="Static memory fraction")
-    parser.add_argument("--max-new-tokens", type=int, default=128, help="Maximum number of new tokens to generate")
+    parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum number of new tokens to generate")
     args = parser.parse_args()
 
     model_name = args.model_name
@@ -57,72 +58,100 @@ def main():
     mem_fraction_static = args.mem_fraction_static
     max_new_tokens = args.max_new_tokens
     enable_vortex_sparsity = True
-    
+
+    output_dir = f"DATA/{model_name}/AIME24/gpu_{mem_fraction_static}/max_tokens_{max_new_tokens}"
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Arguments: model={model_name}, backend={name}, mem_fraction={mem_fraction_static}, max_tokens={max_new_tokens}")
+
     if name not in ["cpu_vtx_flashinfer", "flashinfer"]:
         enable_vortex_sparsity = False
         attention_backend = "flashinfer"
     else:
         attention_backend = name
 
-    llm = sgl.Engine(model_path=model_name,
-                    disable_cuda_graph=False,
-                    page_size=16,
-                    mem_fraction_static=mem_fraction_static,
-                    cpu_mem_fraction=0.7,
-                    vortex_topk_val=30,
-                    disable_overlap_schedule=True,
-                    attention_backend=attention_backend,
-                    enable_vortex_sparsity=enable_vortex_sparsity,
-                    vortex_page_reserved_bos=1,
-                    vortex_page_reserved_eos=1,
-                    vortex_layers_skip=[],
-                    enable_cpu_vtx_cache=True,
-                    vortex_module_name="block_sparse_attention",
-                    vortex_max_seq_lens=-1,
-                    )
-    
-    dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
+    llm = None
+    try:
+        print(f"Initializing SGLang Engine...")
+        # Create crash dump folder
+        crash_dump_folder = f"{output_dir}/crash_dumps"
+        os.makedirs(crash_dump_folder, exist_ok=True)
 
-    requests = generate_requests(dataset, "problem", MATH_QUERY_TEMPLATE)
-    
-    
-    texts = [
-        x["conversations"] for x in requests
-    ]
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    prompts = [
-        tokenizer.apply_chat_template(
-        text,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=True
-    ) for text in texts
-    ] * 8
+        llm = sgl.Engine(model_path=model_name,
+                        disable_cuda_graph=False,
+                        page_size=16,
+                        mem_fraction_static=mem_fraction_static,
+                        cpu_mem_fraction=0.3,
+                        vortex_topk_val=30,
+                        disable_overlap_schedule=True,
+                        attention_backend=attention_backend,
+                        enable_vortex_sparsity=enable_vortex_sparsity,
+                        vortex_page_reserved_bos=1,
+                        vortex_page_reserved_eos=1,
+                        vortex_layers_skip=[],
+                        enable_cpu_vtx_cache=True,
+                        vortex_module_name="block_sparse_attention",
+                        vortex_max_seq_lens=-1,
+                        tp_size=1,
+                        log_level="debug",
+                        crash_dump_folder=crash_dump_folder
+                        )
+        print("Engine initialized successfully!")
 
-    sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": max_new_tokens}
-    total_tokens = 0
-    total_time = 0.0
-    start = time.perf_counter()
-    o = llm.generate(prompts, sampling_params)
-    elapsed = time.perf_counter() - start
-    total_time += elapsed
-    e2e_time = 0
+        dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
 
-    # Create output directory
-    output_dir = f"DATA/{model_name}/AIME24/gpu_{mem_fraction_static}/max_tokens_{max_new_tokens}"
-    os.makedirs(output_dir, exist_ok=True)
+        requests = generate_requests(dataset, "problem", MATH_QUERY_TEMPLATE)
 
-    with open(f"{output_dir}/{name}.jsonl", "w", encoding="utf-8") as f:
-        for item in o:
-            total_tokens += item["meta_info"]["completion_tokens"] 
-            e2e_time = max(e2e_time, item["meta_info"]["e2e_latency"])
-            json.dump(item, f, ensure_ascii=False)
+
+        texts = [
+            x["conversations"] for x in requests
+        ]
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        prompts = [
+            tokenizer.apply_chat_template(
+            text,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True
+        ) for text in texts
+        ] * 8
+
+        print(f"Starting generation with {len(prompts)} prompts...")
+        sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": max_new_tokens}
+        total_tokens = 0
+        total_time = 0.0
+        start = time.perf_counter()
+        o = llm.generate(prompts, sampling_params)
+        elapsed = time.perf_counter() - start
+        total_time += elapsed
+        e2e_time = 0
+
+        print(f"Generation completed in {elapsed:.2f}s")
+        with open(f"{output_dir}/{name}.jsonl", "w", encoding="utf-8") as f:
+            for item in o:
+                total_tokens += item["meta_info"]["completion_tokens"]
+                e2e_time = max(e2e_time, item["meta_info"]["e2e_latency"])
+                json.dump(item, f, ensure_ascii=False)
+                f.write("\n")
+
+            meta_data = {"e2e_time": e2e_time, "total_time": total_time, "total_tokens": total_tokens, "throughput": total_tokens / total_time}
+            json.dump(meta_data, f, ensure_ascii=False)
             f.write("\n")
-        
-        meta_data = {"e2e_time": e2e_time, "total_time": total_time, "total_tokens": total_tokens, "throughput": total_tokens / total_time}
-        json.dump(meta_data, f, ensure_ascii=False)
-        f.write("\n")
-        
+
+        print(f"Results saved to {output_dir}/{name}.jsonl")
+        print(f"Total tokens: {total_tokens}, Throughput: {total_tokens / total_time:.2f} tokens/s")
+
+    except Exception as e:
+        print(f"ERROR: {type(e).__name__}: {e}")
+        print("Full traceback:")
+        traceback.print_exc()
+        raise
+    finally:
+        if llm is not None:
+            try:
+                llm.shutdown()
+            except Exception as e:
+                print(f"Error during shutdown: {e}")
+
 if __name__ == "__main__":
     main()
