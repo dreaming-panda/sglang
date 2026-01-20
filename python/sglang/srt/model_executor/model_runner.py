@@ -969,18 +969,15 @@ class ModelRunner:
                 context_len = self.model_config.context_len
                 dtype_size = torch._utils._element_size(self.kv_cache_dtype)
 
+                # Use context_len // 2 as practical heuristic for average context length
+                effective_context_len = context_len // 2
+
                 # K/V bytes per token
                 kv_bytes_per_token = (
                     num_kv_heads * self.model_config.head_dim * 2 * dtype_size * num_layers
                 )
 
-                # STEP 1: Calculate max_tokens_cpu from available CPU memory
-                total_cpu_memory = psutil.virtual_memory().available
-                usable_cpu_bytes = int(total_cpu_memory * self.server_args.cpu_mem_fraction)
-                max_tokens_from_cpu = usable_cpu_bytes // kv_bytes_per_token
-
-                # STEP 2: Calculate max_reqs from GPU staging buffer
-                # GPU staging holds: batch_size * pages_per_request tokens of K/V
+                # GPU staging: pages_per_request tokens per concurrent request
                 pages_per_request = (
                     self.server_args.vortex_topk_val
                     + self.server_args.vortex_page_reserved_bos
@@ -988,7 +985,7 @@ class ModelRunner:
                 )
                 tokens_per_request_gpu = pages_per_request * page_size
 
-                # Landmark bytes per CPU token (centroids stored on GPU for all CPU pages)
+                # Landmark bytes per token (centroids stored on GPU for all CPU tokens)
                 cache_meta_info = self.sparse_attention.get_cache_meta_info(page_size, self.model_config.head_dim)
                 landmark_bytes_per_page = 0
                 for cache_name, cache_shape in cache_meta_info.items():
@@ -1000,46 +997,44 @@ class ModelRunner:
                 rest_gpu_memory = available_gpu_memory - total_gpu_memory * (1 - self.mem_fraction_static)
                 available_gpu_bytes = rest_gpu_memory * (1 << 30)
 
-                # GPU must hold: staging + landmarks for max_tokens_cpu
-                # Solve for max_reqs: staging = max_reqs * tokens_per_request_gpu * kv_bytes_per_token
-                #                     landmarks = max_tokens_cpu * landmark_bytes_per_token
-                landmarks_bytes = max_tokens_from_cpu * landmark_bytes_per_token
-                staging_bytes_available = available_gpu_bytes - landmarks_bytes
-                if staging_bytes_available <= 0:
-                    raise ValueError(
-                        f"GPU memory insufficient for landmarks. "
-                        f"Landmarks need {landmarks_bytes/(1<<30):.2f}GB but only {available_gpu_bytes/(1<<30):.2f}GB available. "
-                        f"Reduce cpu_mem_fraction (current: {self.server_args.cpu_mem_fraction}) or increase mem_fraction_static."
-                    )
+                # Available CPU memory
+                total_cpu_memory = psutil.virtual_memory().available
+                usable_cpu_bytes = int(total_cpu_memory * self.server_args.cpu_mem_fraction)
 
-                max_tokens_from_gpu = int(staging_bytes_available / kv_bytes_per_token)
-                max_reqs_from_gpu = max_tokens_from_gpu // tokens_per_request_gpu
+                # GPU constraint
+                bytes_per_req_staging = tokens_per_request_gpu * kv_bytes_per_token
+                bytes_per_req_landmark = effective_context_len * landmark_bytes_per_token
+                total_bytes_per_req_gpu = bytes_per_req_staging + bytes_per_req_landmark
+                max_reqs_from_gpu = int(available_gpu_bytes / total_bytes_per_req_gpu)
 
-                # STEP 3: Check if CPU can support (max_reqs_from_gpu // 2) * context_len
-                # We use // 2 because GPU operates at half capacity to prevent collision in copy kernel
-                effective_max_reqs = max_reqs_from_gpu // 2
-                required_cpu_tokens = effective_max_reqs * (context_len // 2)
-                if max_tokens_from_cpu < required_cpu_tokens:
+                # CPU constraint
+                bytes_per_req_cpu = effective_context_len * kv_bytes_per_token
+                max_reqs_from_cpu = int(usable_cpu_bytes / bytes_per_req_cpu)
+
+                # CPU must NOT be the bottleneck - if it is, error out
+                if max_reqs_from_cpu < max_reqs_from_gpu:
                     raise ValueError(
                         f"CPU memory insufficient for CPU VTX backend. "
-                        f"GPU batch size ({effective_max_reqs} reqs) requires {required_cpu_tokens} CPU tokens "
-                        f"({required_cpu_tokens * kv_bytes_per_token / (1<<30):.2f}GB), "
-                        f"but CPU can only hold {max_tokens_from_cpu} tokens "
-                        f"({usable_cpu_bytes/(1<<30):.2f}GB available). "
-                        f"Options: (1) Increase cpu_mem_fraction (current: {self.server_args.cpu_mem_fraction}), "
-                        f"(2) Reduce mem_fraction_static (current: {self.mem_fraction_static}) to reduce GPU batch size, "
-                        f"(3) Add more system RAM."
+                        f"GPU can support {max_reqs_from_gpu} requests but CPU only {max_reqs_from_cpu}. "
+                        f"Increase cpu_mem_fraction (current: {self.server_args.cpu_mem_fraction}) "
+                        f"or add more system RAM."
                     )
 
-                # Use required CPU tokens (matched to effective GPU batch size)
-                max_tokens_from_cpu = required_cpu_tokens
+                # GPU is the binding constraint (apply safety factor for LRU collision avoidance)
+                max_reqs = max_reqs_from_gpu // 2
+
+                # Compute actual tokens needed for buffer initialization
+                max_tokens_cpu = max_reqs * effective_context_len  # CPU buffer
+                max_tokens_gpu = max_reqs_from_gpu * tokens_per_request_gpu  # GPU staging
 
                 logger.info(
-                    f"CPU VTX memory: max_reqs={effective_max_reqs} (gpu_capacity={max_reqs_from_gpu}), "
-                    f"max_tokens_cpu={max_tokens_from_cpu}, max_tokens_gpu={max_tokens_from_gpu}, "
+                    f"CPU VTX memory: max_reqs={max_reqs}, "
+                    f"max_tokens_cpu={max_tokens_cpu}, max_tokens_gpu={max_tokens_gpu}, "
+                    f"gpu_constraint={max_reqs_from_gpu}, cpu_constraint={max_reqs_from_cpu}, "
+                    f"effective_context_len={effective_context_len}, "
                     f"gpu_mem={rest_gpu_memory:.2f}GB, cpu_mem={usable_cpu_bytes/(1<<30):.2f}GB"
                 )
-                return (max_tokens_from_cpu, max_tokens_from_gpu)
+                return (max_tokens_cpu, max_tokens_gpu)
             else:
                 # Standard vortex: GPU stores full KV cache + landmark buffer
                 cell_size = (
@@ -1138,8 +1133,6 @@ class ModelRunner:
                 4096 if not self.server_args.enable_vortex_sparsity else 1024,
             )
 
-        # For CPU VTX backends, cap max_num_reqs to what GPU staging buffer can handle
-        # Use // 2 to operate GPU at half capacity to prevent collision in copy kernel
         if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
             pages_per_request = (
                 self.server_args.vortex_topk_val

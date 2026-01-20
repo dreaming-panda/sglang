@@ -51,12 +51,14 @@ def main():
     parser.add_argument("--attention-backend", type=str, default="cpu_vtx_flashinfer", help="Attention backend")
     parser.add_argument("--mem-fraction-static", type=float, default=0.8, help="Static memory fraction")
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum number of new tokens to generate")
+    parser.add_argument("--disable-cuda-graph", action="store_true", default=False, help="Disable CUDA graph (default: enabled)")
     args = parser.parse_args()
 
     model_name = args.model_name
     name = args.attention_backend
     mem_fraction_static = args.mem_fraction_static
     max_new_tokens = args.max_new_tokens
+    disable_cuda_graph = args.disable_cuda_graph
     enable_vortex_sparsity = True
 
     output_dir = f"DATA/{model_name}/AIME24/gpu_{mem_fraction_static}/max_tokens_{max_new_tokens}"
@@ -77,10 +79,10 @@ def main():
         os.makedirs(crash_dump_folder, exist_ok=True)
 
         llm = sgl.Engine(model_path=model_name,
-                        disable_cuda_graph=False,
+                        disable_cuda_graph=disable_cuda_graph,
                         page_size=16,
                         mem_fraction_static=mem_fraction_static,
-                        cpu_mem_fraction=0.3,
+                        cpu_mem_fraction=0.5,
                         vortex_topk_val=30,
                         disable_overlap_schedule=True,
                         attention_backend=attention_backend,

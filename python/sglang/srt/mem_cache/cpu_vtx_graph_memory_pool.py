@@ -1,9 +1,8 @@
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-from contextlib import nullcontext
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -130,7 +129,15 @@ class CPUVTXGraphTokenToKVPool(KVCache):
 
         self.cpu_to_gpu_slot_maps = []
         self.gpu_to_cpu_page_maps = []
-        self.slot_ages = []
+
+        # Hive-style data structures (per layer)
+        WAYS = 32
+        num_sets = staging_buffer_capacity // WAYS
+        self.num_sets = num_sets
+        self.slot_stamps = []
+        self.set_clocks = []
+        self.set_versions = []
+        self.set_used_masks = []
 
         for _ in range(self.layer_num):
             cpu_to_gpu_map = torch.full(
@@ -143,15 +150,26 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             ).contiguous()
             self.gpu_to_cpu_page_maps.append(gpu_to_cpu_map)
 
-            slot_ages = torch.zeros(staging_buffer_capacity, dtype=torch.uint8, device=self.device).contiguous()
-            self.slot_ages.append(slot_ages)
+            # Hive data structures: timestamps + per-set clocks + seqlocks + used masks
+            slot_stamps = torch.zeros(staging_buffer_capacity, dtype=torch.int32, device=self.device).contiguous()
+            set_clock = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
+            set_version = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
+            set_used_mask = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
+
+            # Initialize Hive structures via kernel (sets clock=1, version=0)
+            vortex_torch.cache.init_hive_structures(
+                slot_stamps, set_clock, set_version, staging_buffer_capacity, num_sets
+            )
+
+            self.slot_stamps.append(slot_stamps)
+            self.set_clocks.append(set_clock)
+            self.set_versions.append(set_version)
+            self.set_used_masks.append(set_used_mask)
             
         self.max_num_pages = staging_buffer_capacity
         self.temp_owners_bitmap = torch.zeros(self.max_num_pages, dtype=torch.bool, device=self.device).contiguous()
         self.temp_staging_slots = torch.zeros(self.max_num_pages, dtype=torch.int32, device=self.device).contiguous()
         self.temp_overflow_flag = torch.zeros(1, dtype=torch.int32, device=self.device).contiguous()
-        self.temp_slots_used_bitmap = torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
-        self.temp_needs_eviction_bitmap = torch.zeros(self.max_num_pages, dtype=torch.bool, device=self.device).contiguous()
         self.temp_evicted_cpu_pages = torch.full((self.max_num_pages,), -1, dtype=torch.int32, device=self.device).contiguous()
 
         self.max_page_id = max_page_id
@@ -262,22 +280,36 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         else:
             dst_staging_slots = dst_kv_indices
 
-        vortex_torch.cache.copy_sparse_kv_to_gpu_with_indptr(
+        # Step 1: Allocation kernel (Hive-style lock-free with seqlock)
+        vortex_torch.cache.allocate_pages_hive(
+            sparse_kv_indices=sparse_kv_indices,
+            sparse_kv_indptr=sparse_kv_indptr,
+            cpu_to_gpu_slot_map=cpu_to_gpu_map,
+            gpu_to_cpu_page_map=gpu_to_cpu_map,
+            slot_stamps=self.slot_stamps[layer_idx],
+            set_clock=self.set_clocks[layer_idx],
+            set_version=self.set_versions[layer_idx],
+            set_used_mask=self.set_used_masks[layer_idx],
+            dst_gpu_slots=dst_staging_slots,
+            owners_bitmap=self.temp_owners_bitmap,
+            evicted_cpu_pages=self.temp_evicted_cpu_pages,
+            overflow_flag=self.temp_overflow_flag,
+            batch_size=batch_size,
+            num_kv_heads=self.head_num,
+            max_num_pages=self.max_num_pages,
+        )
+
+        # Step 2: Copy kernel
+        vortex_torch.cache.copy_kv(
             cpu_k_buffer=cpu_k,
             cpu_v_buffer=cpu_v,
             gpu_k_buffer=gpu_k,
             gpu_v_buffer=gpu_v,
             sparse_kv_indices=sparse_kv_indices,
             sparse_kv_indptr=sparse_kv_indptr,
-            cpu_to_gpu_slot_map=cpu_to_gpu_map,
-            gpu_to_cpu_page_map=gpu_to_cpu_map,
-            slot_ages=self.slot_ages[layer_idx],
             dst_gpu_slots=dst_staging_slots,
             owners_bitmap=self.temp_owners_bitmap,
-            slots_used_bitmap=self.temp_slots_used_bitmap,
-            needs_eviction_bitmap=self.temp_needs_eviction_bitmap,
             evicted_cpu_pages=self.temp_evicted_cpu_pages,
-            overflow_flag=self.temp_overflow_flag,
             page_size=self.page_size,
             batch_size=batch_size,
             num_kv_heads=self.head_num,
