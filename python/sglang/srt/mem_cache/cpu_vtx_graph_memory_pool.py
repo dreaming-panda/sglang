@@ -130,7 +130,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         self.cpu_to_gpu_slot_maps = []
         self.gpu_to_cpu_page_maps = []
 
-        # Hive-style data structures (per layer)
+        # Hybrid-style data structures (per layer)
         WAYS = 32
         num_sets = staging_buffer_capacity // WAYS
         self.num_sets = num_sets
@@ -150,14 +150,14 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             ).contiguous()
             self.gpu_to_cpu_page_maps.append(gpu_to_cpu_map)
 
-            # Hive data structures: timestamps + per-set clocks + seqlocks + used masks
+            # Hybrid data structures: timestamps + per-set clocks + seqlocks + used masks
             slot_stamps = torch.zeros(staging_buffer_capacity, dtype=torch.int32, device=self.device).contiguous()
             set_clock = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
             set_version = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
             set_used_mask = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
 
-            # Initialize Hive structures via kernel (sets clock=1, version=0)
-            vortex_torch.cache.init_hive_structures(
+            # Initialize hybrid structures via kernel (sets clock=1, version=0)
+            vortex_torch.cache.init_hybrid_structures(
                 slot_stamps, set_clock, set_version, staging_buffer_capacity, num_sets
             )
 
@@ -280,8 +280,8 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         else:
             dst_staging_slots = dst_kv_indices
 
-        # Step 1: Allocation kernel (Hive-style lock-free with seqlock)
-        vortex_torch.cache.allocate_pages_hive(
+        # Step 1: Allocation kernel (Hybrid lock-free with seqlock)
+        vortex_torch.cache.allocate_pages_hybrid(
             sparse_kv_indices=sparse_kv_indices,
             sparse_kv_indptr=sparse_kv_indptr,
             cpu_to_gpu_slot_map=cpu_to_gpu_map,
