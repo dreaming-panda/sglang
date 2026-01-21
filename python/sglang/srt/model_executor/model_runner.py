@@ -972,12 +972,17 @@ class ModelRunner:
                 # Use context_len // 2 as practical heuristic for average context length
                 effective_context_len = context_len // 2
 
-                # K/V bytes per token
-                kv_bytes_per_token = (
-                    num_kv_heads * self.model_config.head_dim * 2 * dtype_size * num_layers
+                # Layer skip configuration: layers in layer_skip use full GPU attention
+                layer_skip = self.server_args.vortex_layers_skip or []
+                num_full_layers = len(layer_skip)
+                num_sparse_layers = num_layers - num_full_layers
+
+                # K/V bytes per token per layer
+                kv_bytes_per_token_per_layer = (
+                    num_kv_heads * self.model_config.head_dim * 2 * dtype_size
                 )
 
-                # GPU staging: pages_per_request tokens per concurrent request
+                # GPU staging: pages_per_request tokens per concurrent request (sparse layers only)
                 pages_per_request = (
                     self.server_args.vortex_topk_val
                     + self.server_args.vortex_page_reserved_bos
@@ -985,13 +990,14 @@ class ModelRunner:
                 )
                 tokens_per_request_gpu = pages_per_request * page_size
 
-                # Landmark bytes per token (centroids stored on GPU for all CPU tokens)
+                # Landmark bytes per token (sparse layers only)
                 cache_meta_info = self.sparse_attention.get_cache_meta_info(page_size, self.model_config.head_dim)
                 landmark_bytes_per_page = 0
                 for cache_name, cache_shape in cache_meta_info.items():
                     if cache_name not in ["k", "v"]:
                         landmark_bytes_per_page += cache_shape[0] * cache_shape[1] * dtype_size
-                landmark_bytes_per_token = landmark_bytes_per_page * num_kv_heads * num_layers / page_size
+                # Scale by sparse layers only
+                landmark_bytes_per_token = landmark_bytes_per_page * num_kv_heads * num_sparse_layers / page_size
 
                 # Available GPU memory
                 rest_gpu_memory = available_gpu_memory - total_gpu_memory * (1 - self.mem_fraction_static)
@@ -1001,18 +1007,27 @@ class ModelRunner:
                 total_cpu_memory = psutil.virtual_memory().available
                 usable_cpu_bytes = int(total_cpu_memory * self.server_args.cpu_mem_fraction)
 
-                # GPU constraint
-                bytes_per_req_staging = tokens_per_request_gpu * kv_bytes_per_token
+                # Memory per request formula:
+                # GPU = full_attn_ctx * kv_per_layer * full_layers (exact)
+                #     + 2 * staging_tokens * kv_per_layer * sparse_layers (2x safety for LRU)
+                #     + ctx * landmark_per_token (sparse only)
+                # CPU = ctx * kv_per_layer * sparse_layers
+                #
+                # The 2x safety factor is applied ONLY to staging (for LRU collision avoidance),
+                # not to full attention layers which use standard paged KV cache.
+                staging_safety_factor = 2
+                bytes_per_req_full_gpu = effective_context_len * kv_bytes_per_token_per_layer * num_full_layers
+                bytes_per_req_staging = staging_safety_factor * tokens_per_request_gpu * kv_bytes_per_token_per_layer * num_sparse_layers
                 bytes_per_req_landmark = effective_context_len * landmark_bytes_per_token
-                total_bytes_per_req_gpu = bytes_per_req_staging + bytes_per_req_landmark
-                max_reqs_from_gpu = int(available_gpu_bytes / total_bytes_per_req_gpu)
+                total_bytes_per_req_gpu = bytes_per_req_full_gpu + bytes_per_req_staging + bytes_per_req_landmark
 
-                # CPU constraint
-                bytes_per_req_cpu = effective_context_len * kv_bytes_per_token
-                max_reqs_from_cpu = int(usable_cpu_bytes / bytes_per_req_cpu)
+                bytes_per_req_cpu = effective_context_len * kv_bytes_per_token_per_layer * num_sparse_layers
+
+                max_reqs_from_gpu = int(available_gpu_bytes / total_bytes_per_req_gpu) if total_bytes_per_req_gpu > 0 else 10000
+                max_reqs_from_cpu = int(usable_cpu_bytes / bytes_per_req_cpu) if bytes_per_req_cpu > 0 else 10000
 
                 # CPU must NOT be the bottleneck - if it is, error out
-                if max_reqs_from_cpu < max_reqs_from_gpu:
+                if max_reqs_from_cpu < max_reqs_from_gpu and num_sparse_layers > 0:
                     raise ValueError(
                         f"CPU memory insufficient for CPU VTX backend. "
                         f"GPU can support {max_reqs_from_gpu} requests but CPU only {max_reqs_from_cpu}. "
@@ -1020,21 +1035,24 @@ class ModelRunner:
                         f"or add more system RAM."
                     )
 
-                # GPU is the binding constraint (apply safety factor for LRU collision avoidance)
-                max_reqs = max_reqs_from_gpu // 2
+                # GPU is the binding constraint (safety factor already included in staging calculation)
+                max_reqs = max_reqs_from_gpu
 
                 # Compute actual tokens needed for buffer initialization
-                max_tokens_cpu = max_reqs * effective_context_len  # CPU buffer
-                max_tokens_gpu = max_reqs_from_gpu * tokens_per_request_gpu  # GPU staging
+                max_tokens_cpu = max_reqs * effective_context_len  # CPU buffer (sparse layers)
+                max_tokens_gpu_staging = staging_safety_factor * max_reqs * tokens_per_request_gpu  # GPU staging (2x safety)
+                max_tokens_gpu_full = max_reqs * effective_context_len  # GPU full attention (exact)
 
                 logger.info(
                     f"CPU VTX memory: max_reqs={max_reqs}, "
-                    f"max_tokens_cpu={max_tokens_cpu}, max_tokens_gpu={max_tokens_gpu}, "
+                    f"max_tokens_cpu={max_tokens_cpu}, max_tokens_gpu_staging={max_tokens_gpu_staging}, "
+                    f"max_tokens_gpu_full={max_tokens_gpu_full}, "
+                    f"num_full_layers={num_full_layers}, num_sparse_layers={num_sparse_layers}, "
                     f"gpu_constraint={max_reqs_from_gpu}, cpu_constraint={max_reqs_from_cpu}, "
                     f"effective_context_len={effective_context_len}, "
                     f"gpu_mem={rest_gpu_memory:.2f}GB, cpu_mem={usable_cpu_bytes/(1<<30):.2f}GB"
                 )
-                return (max_tokens_cpu, max_tokens_gpu)
+                return (max_tokens_cpu, max_tokens_gpu_staging, max_tokens_gpu_full)
             else:
                 # Standard vortex: GPU stores full KV cache + landmark buffer
                 cell_size = (
@@ -1115,12 +1133,14 @@ class ModelRunner:
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
         if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
-            max_total_num_tokens_cpu, max_total_num_tokens_gpu = self.profile_max_num_token(total_gpu_memory)
+            max_total_num_tokens_cpu, max_total_num_tokens_gpu_staging, max_total_num_tokens_gpu_full = self.profile_max_num_token(total_gpu_memory)
             self.max_total_num_tokens = max_total_num_tokens_cpu
-            self.max_total_num_tokens_gpu = max_total_num_tokens_gpu
+            self.max_total_num_tokens_gpu = max_total_num_tokens_gpu_staging
+            self.max_total_num_tokens_gpu_full = max_total_num_tokens_gpu_full
         else:
             self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
             self.max_total_num_tokens_gpu = None
+            self.max_total_num_tokens_gpu_full = None
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -1312,9 +1332,11 @@ class ModelRunner:
                     device=self.device,
                     page_size=self.page_size,
                     gpu_size=self.max_total_num_tokens_gpu,
+                    gpu_full_size=self.max_total_num_tokens_gpu_full,
                     sparse_attention=self.sparse_attention,
                     memory_saver_adapter=self.memory_saver_adapter,
                     model_runner=self,
+                    layer_skip=self.server_args.vortex_layers_skip,
                     enable_custom_mem_pool=False,
                 )
             elif self.server_args.enable_vortex_sparsity:

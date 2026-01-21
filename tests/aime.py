@@ -89,7 +89,7 @@ def main():
                         enable_vortex_sparsity=enable_vortex_sparsity,
                         vortex_page_reserved_bos=1,
                         vortex_page_reserved_eos=1,
-                        vortex_layers_skip=[],
+                        vortex_layers_skip=[0],
                         enable_cpu_vtx_cache=True,
                         vortex_module_name="block_sparse_attention",
                         vortex_max_seq_lens=-1,

@@ -697,17 +697,26 @@ class CPUVTXCGAttnBackend(AttentionBackend):
             )
 
         else:
-            # Dense attention path (for skipped layers)
-            # o = self.forward_metadata.decode_wrappers[0].forward(
-            #     q.contiguous().view(-1, self.group_size, layer.head_dim),
-            #     (k_staging, v_staging),
-            #     sm_scale=layer.scaling,
-            #     logits_soft_cap=layer.logit_cap,
-            #     k_scale=layer.k_scale,
-            #     v_scale=layer.v_scale,
-            # )
-            
-            raise NotImplementedError("Layer skipping not yet implemented for CPU Cache")
+            # Dense attention path (for full attention layers in layer_skip)
+            # Save KV directly to GPU buffer
+            if k is not None:
+                assert v is not None
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer_decode(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
+
+            # Get GPU KV buffers directly for full attention
+            k_gpu, v_gpu = forward_batch.token_to_kv_pool.get_kv_buffer_gpu(layer.layer_id)
+
+            o = self.forward_metadata.decode_wrappers[0].forward(
+                q.contiguous().view(-1, self.group_size, layer.head_dim),
+                (k_gpu, v_gpu),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

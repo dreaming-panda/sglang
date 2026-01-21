@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import torch
@@ -30,9 +30,11 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         device: torch.device,
         page_size: int,
         gpu_size: int,
+        gpu_full_size: int,
         sparse_attention,
         memory_saver_adapter,
         model_runner,
+        layer_skip: Optional[List[int]] = None,
         enable_custom_mem_pool: bool = False,
     ):
         super().__init__(
@@ -46,10 +48,25 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             end_layer=layer_num,
         )
         self.gpu_size = gpu_size
+        self.gpu_full_size = gpu_full_size
         self.head_num = head_num
         self.head_dim = head_dim
         self.memory_saver_adapter = memory_saver_adapter
         self.enable_custom_mem_pool = enable_custom_mem_pool
+
+        # Classify layers into full attention (in layer_skip) and sparse attention
+        self.layer_skip_set: Set[int] = set(layer_skip) if layer_skip else set()
+        self.full_attention_layer_ids = sorted([i for i in range(layer_num) if i in self.layer_skip_set])
+        self.sparse_attention_layer_ids = sorted([i for i in range(layer_num) if i not in self.layer_skip_set])
+        self.num_full_layers = len(self.full_attention_layer_ids)
+        self.num_sparse_layers = len(self.sparse_attention_layer_ids)
+
+        # Layer mapping: global_layer_id -> (local_id, is_sparse)
+        self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
+        for local_id, global_id in enumerate(self.full_attention_layer_ids):
+            self.layers_mapping[global_id] = (local_id, False)  # False = full attention
+        for local_id, global_id in enumerate(self.sparse_attention_layer_ids):
+            self.layers_mapping[global_id] = (local_id, True)   # True = sparse attention
 
         self.sparse_attention = sparse_attention
         self.ctx = vortex_torch.cache.Context()
@@ -65,45 +82,43 @@ class CPUVTXGraphTokenToKVPool(KVCache):
 
         cache_size = self.get_cache_size_bytes()
         staging_size = self.get_staging_size_bytes()
+        full_attn_size = self.get_full_attention_size_bytes()
 
         print(
-            f"CPU VTX Graph Cache allocated. #tokens: {size}, "
-            f"Cache size: {cache_size / GB:.2f} GB (CPU), "
-            f"Staging size: {staging_size / GB:.2f} GB (GPU)"
+            f"CPU VTX Graph Cache allocated. #tokens_cpu: {size}, #tokens_gpu_staging: {gpu_size}, "
+            f"#tokens_gpu_full: {gpu_full_size}, "
+            f"num_sparse_layers: {self.num_sparse_layers}, num_full_layers: {self.num_full_layers}, "
+            f"CPU cache: {cache_size / GB:.2f} GB, GPU staging: {staging_size / GB:.2f} GB, "
+            f"GPU full attention: {full_attn_size / GB:.2f} GB"
         )
 
-        # GPU memory usage (staging buffers only)
-        self.mem_usage = staging_size / GB
+        # GPU memory usage (staging + full attention buffers)
+        self.mem_usage = (staging_size + full_attn_size) / GB
 
         assert self.dtype == torch.bfloat16
         assert self.store_dtype == torch.bfloat16
 
     def _create_buffers(self):
-        self.num_pages = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
-        self.num_pages_gpu = ((self.gpu_size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
+        # Page calculations for different buffer types
+        self.num_pages_cpu = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
+        self.num_pages_gpu_staging = ((self.gpu_size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
+        self.num_pages_gpu_full = ((self.gpu_full_size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
+
+        # For compatibility with vortex context (used for landmarks)
+        self.num_pages = self.num_pages_cpu
 
         self.cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
-        # self.cache_cpu = [
-        #     {
-        #         cache_name: torch.zeros(
-        #             (self.num_pages, cache_shape[0], cache_shape[1]),
-        #             dtype=self.store_dtype,
-        #             device='cpu',
-        #             pin_memory=True,
-        #         )
-        #         for (cache_name, cache_shape) in self.cache_meta_info.items()
-        #     }
-        #     for _ in range(self.layer_num)
-        # ]
-        
+
+        # ========================================
+        # SPARSE ATTENTION LAYERS: CPU + GPU staging
+        # ========================================
         self.cache_cpu = []
-        
-        for _ in range(self.layer_num):
+        for _ in range(self.num_sparse_layers):
             temp = {}
             for (cache_name, cache_shape) in self.cache_meta_info.items():
                 if cache_name in ["k", "v"]:
                     temp[cache_name] = torch.zeros(
-                        (self.num_pages, cache_shape[0], cache_shape[1]),
+                        (self.num_pages_cpu, cache_shape[0], cache_shape[1]),
                         dtype=self.store_dtype,
                         device='cpu',
                         pin_memory=True,
@@ -111,12 +126,13 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             self.cache_cpu.append(temp)
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # GPU staging buffers for sparse layers
             self.cache_staging = []
-            for _ in range(self.layer_num):
+            for _ in range(self.num_sparse_layers):
                 layer_cache = {}
                 for (cache_name, cache_shape) in self.cache_meta_info.items():
                     # k and v use GPU staging buffer size; other caches (e.g., centroids) use full CPU size
-                    num_pages_for_cache = self.num_pages_gpu if cache_name in ["k", "v"] else self.num_pages
+                    num_pages_for_cache = self.num_pages_gpu_staging if cache_name in ["k", "v"] else self.num_pages_cpu
                     layer_cache[cache_name] = torch.zeros(
                         (num_pages_for_cache, cache_shape[0], cache_shape[1]),
                         dtype=self.store_dtype,
@@ -124,13 +140,38 @@ class CPUVTXGraphTokenToKVPool(KVCache):
                     )
                 self.cache_staging.append(layer_cache)
 
-        max_page_id = self.num_pages
-        staging_buffer_capacity = self.num_pages_gpu
+            # ========================================
+            # FULL ATTENTION LAYERS: GPU only (standard paged KV cache)
+            # ========================================
+            self.k_buffer_full = [
+                torch.zeros(
+                    (self.num_pages_gpu_full, self.page_size, 1, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.num_full_layers)
+            ]
+            self.v_buffer_full = [
+                torch.zeros(
+                    (self.num_pages_gpu_full, self.page_size, 1, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.num_full_layers)
+            ]
+
+        # Hybrid cache structures for SPARSE layers only
+        self._create_hybrid_structures_sparse()
+
+    def _create_hybrid_structures_sparse(self):
+        """Create hybrid cache management structures for sparse attention layers only."""
+        max_page_id = self.num_pages_cpu
+        staging_buffer_capacity = self.num_pages_gpu_staging
 
         self.cpu_to_gpu_slot_maps = []
         self.gpu_to_cpu_page_maps = []
 
-        # Hybrid-style data structures (per layer)
+        # Hybrid-style data structures (per sparse layer)
         WAYS = 32
         num_sets = staging_buffer_capacity // WAYS
         self.num_sets = num_sets
@@ -139,7 +180,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         self.set_versions = []
         self.set_used_masks = []
 
-        for _ in range(self.layer_num):
+        for _ in range(self.num_sparse_layers):
             cpu_to_gpu_map = torch.full(
                 (max_page_id,), -1, dtype=torch.int32, device=self.device
             ).contiguous()
@@ -165,14 +206,14 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             self.set_clocks.append(set_clock)
             self.set_versions.append(set_version)
             self.set_used_masks.append(set_used_mask)
-            
+
         self.max_num_pages = staging_buffer_capacity
         self.temp_owners_bitmap = torch.zeros(self.max_num_pages, dtype=torch.bool, device=self.device).contiguous()
         self.temp_staging_slots = torch.zeros(self.max_num_pages, dtype=torch.int32, device=self.device).contiguous()
         self.temp_overflow_flag = torch.zeros(1, dtype=torch.int32, device=self.device).contiguous()
         self.temp_evicted_cpu_pages = torch.full((self.max_num_pages,), -1, dtype=torch.int32, device=self.device).contiguous()
 
-        self.max_page_id = max_page_id
+        self.max_page_id_sparse = max_page_id
         self.staging_buffer_capacity = staging_buffer_capacity
 
     def _initialize_graph(self, model_runner) -> None:
@@ -204,9 +245,11 @@ class CPUVTXGraphTokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.cache_cpu
         del self.cache_staging
+        del self.k_buffer_full
+        del self.v_buffer_full
 
     def get_cache_size_bytes(self) -> int:
-        """Return total bytes occupied by CPU cache tensors."""
+        """Return total bytes occupied by CPU cache tensors (sparse layers only)."""
         total_bytes = 0
         for layer_cache in self.cache_cpu:
             for tensor in layer_cache.values():
@@ -214,31 +257,65 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         return total_bytes
 
     def get_staging_size_bytes(self) -> int:
-        """Return total bytes occupied by GPU staging buffers."""
+        """Return total bytes occupied by GPU staging buffers (sparse layers)."""
         total_bytes = 0
         for layer_cache in self.cache_staging:
             for tensor in layer_cache.values():
                 total_bytes += np.prod(tensor.shape) * tensor.dtype.itemsize
         return total_bytes
 
+    def get_full_attention_size_bytes(self) -> int:
+        """Return total bytes occupied by full attention GPU buffers."""
+        total_bytes = 0
+        for k_buf, v_buf in zip(self.k_buffer_full, self.v_buffer_full):
+            total_bytes += np.prod(k_buf.shape) * k_buf.dtype.itemsize
+            total_bytes += np.prod(v_buf.shape) * v_buf.dtype.itemsize
+        return total_bytes
+
+    def is_sparse_layer(self, layer_id: int) -> bool:
+        """Check if a layer uses sparse attention."""
+        return self.layers_mapping[layer_id][1]
+
     def get_key_buffer(self, layer_id: int):
-        """Return CPU K buffer for a layer."""
-        return self.cache_cpu[layer_id - self.start_layer]["k"]
+        """Return K buffer for a layer (CPU for sparse, GPU for full)."""
+        local_id, is_sparse = self.layers_mapping[layer_id]
+        if is_sparse:
+            return self.cache_cpu[local_id]["k"]
+        else:
+            return self.k_buffer_full[local_id]
 
     def get_value_buffer(self, layer_id: int):
-        """Return CPU V buffer for a layer."""
-        return self.cache_cpu[layer_id - self.start_layer]["v"]
+        """Return V buffer for a layer (CPU for sparse, GPU for full)."""
+        local_id, is_sparse = self.layers_mapping[layer_id]
+        if is_sparse:
+            return self.cache_cpu[local_id]["v"]
+        else:
+            return self.v_buffer_full[local_id]
 
     def get_kv_buffer(self, layer_id: int):
-        """Return CPU K and V buffers as tuple. FlashInfer will handle device transfer."""
-        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+        """Return K and V buffers as tuple."""
+        local_id, is_sparse = self.layers_mapping[layer_id]
+        if is_sparse:
+            return self.cache_cpu[local_id]["k"], self.cache_cpu[local_id]["v"]
+        else:
+            return self.k_buffer_full[local_id], self.v_buffer_full[local_id]
+
+    def get_kv_buffer_gpu(self, layer_id: int):
+        """Return GPU K/V buffers for full attention layers only."""
+        local_id, is_sparse = self.layers_mapping[layer_id]
+        if is_sparse:
+            raise ValueError(f"Layer {layer_id} is sparse, not full attention")
+        return self.k_buffer_full[local_id], self.v_buffer_full[local_id]
 
     def get_cache(self, layer_id: int) -> Dict[str, torch.Tensor]:
         """
         Return cache dictionary for sparse attention indexer.
-        Returns GPU staging buffers since indexer runs on GPU.
+        Returns GPU staging buffers since indexer runs on GPU (sparse layers only).
         """
-        return self.cache_staging[layer_id - self.start_layer]
+        local_id, is_sparse = self.layers_mapping[layer_id]
+        if not is_sparse:
+            raise ValueError(f"Layer {layer_id} is full attention, no sparse cache available")
+        return self.cache_staging[local_id]
 
     def copy_sparse_kv_to_gpu(
         self,
@@ -250,6 +327,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
     ):
         """
         CUDA graph compatible sparse KV copy from CPU to GPU staging buffers.
+        Only valid for sparse attention layers.
 
         Args:
             layer_id: Layer index
@@ -263,17 +341,19 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             v_staging: GPU V staging buffer
             dst_staging_slots: GPU slots where pages were placed
         """
-        layer_idx = layer_id - self.start_layer
+        local_id, is_sparse = self.layers_mapping[layer_id]
+        if not is_sparse:
+            raise ValueError(f"Layer {layer_id} is full attention, copy_sparse_kv_to_gpu not applicable")
 
-        # Get CPU and GPU buffers
-        cpu_k = self.cache_cpu[layer_idx]["k"].view(-1, self.page_size, 1, self.head_dim)
-        cpu_v = self.cache_cpu[layer_idx]["v"].view(-1, self.page_size, 1, self.head_dim)
-        gpu_k = self.cache_staging[layer_idx]["k"].view(-1, self.page_size, 1, self.head_dim)
-        gpu_v = self.cache_staging[layer_idx]["v"].view(-1, self.page_size, 1, self.head_dim)
+        # Get CPU and GPU buffers for sparse layer
+        cpu_k = self.cache_cpu[local_id]["k"].view(-1, self.page_size, 1, self.head_dim)
+        cpu_v = self.cache_cpu[local_id]["v"].view(-1, self.page_size, 1, self.head_dim)
+        gpu_k = self.cache_staging[local_id]["k"].view(-1, self.page_size, 1, self.head_dim)
+        gpu_v = self.cache_staging[local_id]["v"].view(-1, self.page_size, 1, self.head_dim)
 
         # Get caching state
-        cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[layer_idx]
-        gpu_to_cpu_map = self.gpu_to_cpu_page_maps[layer_idx]
+        cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[local_id]
+        gpu_to_cpu_map = self.gpu_to_cpu_page_maps[local_id]
 
         if dst_kv_indices is None:
             dst_staging_slots = self.temp_staging_slots
@@ -286,10 +366,10 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             sparse_kv_indptr=sparse_kv_indptr,
             cpu_to_gpu_slot_map=cpu_to_gpu_map,
             gpu_to_cpu_page_map=gpu_to_cpu_map,
-            slot_stamps=self.slot_stamps[layer_idx],
-            set_clock=self.set_clocks[layer_idx],
-            set_version=self.set_versions[layer_idx],
-            set_used_mask=self.set_used_masks[layer_idx],
+            slot_stamps=self.slot_stamps[local_id],
+            set_clock=self.set_clocks[local_id],
+            set_version=self.set_versions[local_id],
+            set_used_mask=self.set_used_masks[local_id],
             dst_gpu_slots=dst_staging_slots,
             owners_bitmap=self.temp_owners_bitmap,
             evicted_cpu_pages=self.temp_evicted_cpu_pages,
@@ -337,44 +417,59 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        """Store KV to CPU cache and update GPU staging if cached."""
+        """Store KV to appropriate cache based on layer type."""
         layer_id = layer.layer_id
-        layer_idx = layer_id - self.start_layer
+        local_id, is_sparse = self.layers_mapping[layer_id]
 
-        cpu_k_buffer = self.cache_cpu[layer_idx]["k"]
-        cpu_v_buffer = self.cache_cpu[layer_idx]["v"]
-        gpu_k_staging = self.cache_staging[layer_idx]["k"]
-        gpu_v_staging = self.cache_staging[layer_idx]["v"]
-        cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[layer_idx]
+        if is_sparse:
+            # Sparse layer: store to CPU + update GPU staging if cached
+            cpu_k_buffer = self.cache_cpu[local_id]["k"]
+            cpu_v_buffer = self.cache_cpu[local_id]["v"]
+            gpu_k_staging = self.cache_staging[local_id]["k"]
+            gpu_v_staging = self.cache_staging[local_id]["v"]
+            cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[local_id]
 
-        vortex_torch.cache.store_kv_cpu_and_gpu(
-            cpu_k_buffer,
-            cpu_v_buffer,
-            gpu_k_staging,
-            gpu_v_staging,
-            cache_k.contiguous(),
-            cache_v.contiguous(),
-            loc,
-            self.page_size,
-            cpu_to_gpu_map,
-            self.max_page_id,
-        )
-        
-        unified_cache = {
-            "k": UnifiedCacheView(
+            vortex_torch.cache.store_kv_cpu_and_gpu(
                 cpu_k_buffer,
-                gpu_k_staging,
-                cpu_to_gpu_map
-            ),
-            "v": UnifiedCacheView(
                 cpu_v_buffer,
+                gpu_k_staging,
                 gpu_v_staging,
-                cpu_to_gpu_map
-            ),
-            "centroids": self.cache_staging[layer_idx]["centroids"]
-        }
-        
-        self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
+                cache_k.contiguous(),
+                cache_v.contiguous(),
+                loc,
+                self.page_size,
+                cpu_to_gpu_map,
+                self.max_page_id_sparse,
+            )
+
+            unified_cache = {
+                "k": UnifiedCacheView(
+                    cpu_k_buffer,
+                    gpu_k_staging,
+                    cpu_to_gpu_map
+                ),
+                "v": UnifiedCacheView(
+                    cpu_v_buffer,
+                    gpu_v_staging,
+                    cpu_to_gpu_map
+                ),
+                "centroids": self.cache_staging[local_id]["centroids"]
+            }
+
+            self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
+        else:
+            # Full attention layer: store directly to GPU using vortex kernel
+            k_buffer = self.k_buffer_full[local_id]
+            v_buffer = self.v_buffer_full[local_id]
+            vortex_torch.cache.set_kv_buffer_launcher(
+                k_buffer,
+                v_buffer,
+                cache_k.contiguous(),
+                cache_v.contiguous(),
+                loc,
+                self.page_size
+            )
+            # Note: No forward_cache call for full attention layers (no landmarks)
 
     def set_kv_buffer_decode(
         self,
@@ -386,7 +481,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        """Store KV during decode phase with unified CPU/GPU memory."""
+        """Store KV during decode phase based on layer type."""
 
         assert layer_id_override is None
         assert k_scale is None
@@ -396,39 +491,54 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         assert loc.dtype == torch.int64
 
         layer_id = layer.layer_id
-        layer_idx = layer_id - self.start_layer
-        
-        cpu_k_buffer = self.cache_cpu[layer_idx]["k"]
-        cpu_v_buffer = self.cache_cpu[layer_idx]["v"]
-        gpu_k_staging = self.cache_staging[layer_idx]["k"]
-        gpu_v_staging = self.cache_staging[layer_idx]["v"]
-        cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[layer_idx]
-        vortex_torch.cache.store_kv_unified(
-            cpu_k_buffer,
-            cpu_v_buffer,
-            gpu_k_staging,
-            gpu_v_staging,
-            cache_k.contiguous(),
-            cache_v.contiguous(),
-            loc,
-            cpu_to_gpu_map,
-            self.page_size,
-        )
-        unified_cache = {
-            "k": UnifiedCacheView(
+        local_id, is_sparse = self.layers_mapping[layer_id]
+
+        if is_sparse:
+            # Sparse layer: store to CPU + update GPU staging
+            cpu_k_buffer = self.cache_cpu[local_id]["k"]
+            cpu_v_buffer = self.cache_cpu[local_id]["v"]
+            gpu_k_staging = self.cache_staging[local_id]["k"]
+            gpu_v_staging = self.cache_staging[local_id]["v"]
+            cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[local_id]
+            vortex_torch.cache.store_kv_unified(
                 cpu_k_buffer,
-                gpu_k_staging,
-                cpu_to_gpu_map
-            ),
-            "v": UnifiedCacheView(
                 cpu_v_buffer,
+                gpu_k_staging,
                 gpu_v_staging,
-                cpu_to_gpu_map
-            ),
-            "centroids": self.cache_staging[layer_idx]["centroids"]
-        }
-        
-        self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
+                cache_k.contiguous(),
+                cache_v.contiguous(),
+                loc,
+                cpu_to_gpu_map,
+                self.page_size,
+            )
+            unified_cache = {
+                "k": UnifiedCacheView(
+                    cpu_k_buffer,
+                    gpu_k_staging,
+                    cpu_to_gpu_map
+                ),
+                "v": UnifiedCacheView(
+                    cpu_v_buffer,
+                    gpu_v_staging,
+                    cpu_to_gpu_map
+                ),
+                "centroids": self.cache_staging[local_id]["centroids"]
+            }
+
+            self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
+        else:
+            # Full attention layer: store directly to GPU using vortex kernel
+            k_buffer = self.k_buffer_full[local_id]
+            v_buffer = self.v_buffer_full[local_id]
+            vortex_torch.cache.set_kv_buffer_launcher(
+                k_buffer,
+                v_buffer,
+                cache_k.contiguous(),
+                cache_v.contiguous(),
+                loc,
+                self.page_size
+            )
+            # Note: No forward_cache call for full attention layers (no landmarks)
 
     def available_size(self) -> int:
         """Return available cache size."""
