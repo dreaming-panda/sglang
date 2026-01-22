@@ -1024,7 +1024,9 @@ class ModelRunner:
                 bytes_per_req_cpu = effective_context_len * kv_bytes_per_token_per_layer * num_sparse_layers
 
                 max_reqs_from_gpu = int(available_gpu_bytes / total_bytes_per_req_gpu) if total_bytes_per_req_gpu > 0 else 10000
-                max_reqs_from_cpu = int(usable_cpu_bytes / bytes_per_req_cpu) if bytes_per_req_cpu > 0 else 10000
+                # CPU memory is shared across all TP ranks, so divide by tp_size
+                total_bytes_per_req_cpu = bytes_per_req_cpu * self.tp_size
+                max_reqs_from_cpu = int(usable_cpu_bytes / total_bytes_per_req_cpu) if total_bytes_per_req_cpu > 0 else 10000
 
                 # CPU must NOT be the bottleneck - if it is, error out
                 if max_reqs_from_cpu < max_reqs_from_gpu and num_sparse_layers > 0:
@@ -1049,8 +1051,8 @@ class ModelRunner:
                     f"max_tokens_gpu_full={max_tokens_gpu_full}, "
                     f"num_full_layers={num_full_layers}, num_sparse_layers={num_sparse_layers}, "
                     f"gpu_constraint={max_reqs_from_gpu}, cpu_constraint={max_reqs_from_cpu}, "
-                    f"effective_context_len={effective_context_len}, "
-                    f"gpu_mem={rest_gpu_memory:.2f}GB, cpu_mem={usable_cpu_bytes/(1<<30):.2f}GB"
+                    f"effective_context_len={effective_context_len}, tp_size={self.tp_size}, "
+                    f"gpu_mem={rest_gpu_memory:.2f}GB, cpu_mem={usable_cpu_bytes/(1<<30):.2f}GB (shared across TP)"
                 )
                 return (max_tokens_cpu, max_tokens_gpu_staging, max_tokens_gpu_full)
             else:
