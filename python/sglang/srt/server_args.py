@@ -189,6 +189,7 @@ class ServerArgs:
     vortex_num_selected_pages: int = 30
     vortex_topk_val: int = 30
     vortex_layers_skip: Optional[List[int]] = None
+    vortex_cpu_percentage: float = 1.0  # Fraction of non-skip layers using CPU sparse attention (0.0-1.0)
     vortex_page_reserved_bos: int = 1
     vortex_page_reserved_eos: int = 1
     enable_cpu_vtx_cache: bool = False  # Enable LRU cache for CPU VTX staging buffer
@@ -1723,6 +1724,12 @@ class ServerArgs:
             "--vortex-layers-skip",
             type=int,
             nargs="+",
+        )
+        parser.add_argument(
+            "--vortex-cpu-percentage",
+            type=float,
+            default=ServerArgs.vortex_cpu_percentage,
+            help="Fraction of non-skip layers using CPU sparse attention (0.0-1.0)",
         )
         parser.add_argument(
             "--vortex-max-seq-lens",

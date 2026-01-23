@@ -972,10 +972,31 @@ class ModelRunner:
                 # Use context_len // 2 as practical heuristic for average context length
                 effective_context_len = context_len // 2
 
-                # Layer skip configuration: layers in layer_skip use full GPU attention
-                layer_skip = self.server_args.vortex_layers_skip or []
-                num_full_layers = len(layer_skip)
-                num_sparse_layers = num_layers - num_full_layers
+                # Layer configuration:
+                # 1. Full attention layers (vortex_layers_skip) - dense attention, full GPU KV
+                # 2. GPU sparse layers (from 1-cpu_percentage) - sparse attention, full GPU KV, no copying
+                # 3. CPU sparse layers (from cpu_percentage) - sparse attention, CPU KV with GPU staging
+                explicit_layer_skip = set(self.server_args.vortex_layers_skip or [])
+                non_skip_layers = sorted([i for i in range(num_layers) if i not in explicit_layer_skip])
+
+                cpu_percentage = self.server_args.vortex_cpu_percentage
+                num_cpu_sparse_layers = int(cpu_percentage * len(non_skip_layers))
+                num_gpu_sparse_layers = len(non_skip_layers) - num_cpu_sparse_layers
+
+                # CPU sparse layers from the start, GPU sparse layers from the end
+                cpu_sparse_layer_ids = non_skip_layers[:num_cpu_sparse_layers]
+                gpu_sparse_layer_ids = non_skip_layers[num_cpu_sparse_layers:]
+
+                # Store layer classification for pool and backend
+                self.full_attention_layer_ids = sorted(list(explicit_layer_skip))
+                self.gpu_sparse_layer_ids = gpu_sparse_layer_ids
+                self.cpu_sparse_layer_ids = cpu_sparse_layer_ids
+
+                # For memory calculation:
+                # - Full attention layers + GPU sparse layers: both need full GPU KV cache
+                # - CPU sparse layers: need CPU KV cache + GPU staging buffer
+                num_full_gpu_layers = len(explicit_layer_skip) + num_gpu_sparse_layers
+                num_cpu_sparse = num_cpu_sparse_layers
 
                 # K/V bytes per token per layer
                 kv_bytes_per_token_per_layer = (
@@ -990,14 +1011,15 @@ class ModelRunner:
                 )
                 tokens_per_request_gpu = pages_per_request * page_size
 
-                # Landmark bytes per token (sparse layers only)
+                # Landmark bytes per token (all sparse layers need landmarks: GPU sparse + CPU sparse)
+                num_all_sparse_layers = num_gpu_sparse_layers + num_cpu_sparse
                 cache_meta_info = self.sparse_attention.get_cache_meta_info(page_size, self.model_config.head_dim)
                 landmark_bytes_per_page = 0
                 for cache_name, cache_shape in cache_meta_info.items():
                     if cache_name not in ["k", "v"]:
                         landmark_bytes_per_page += cache_shape[0] * cache_shape[1] * dtype_size
-                # Scale by sparse layers only
-                landmark_bytes_per_token = landmark_bytes_per_page * num_kv_heads * num_sparse_layers / page_size
+                # Scale by all sparse layers (GPU sparse + CPU sparse)
+                landmark_bytes_per_token = landmark_bytes_per_page * num_kv_heads * num_all_sparse_layers / page_size
 
                 # Available GPU memory
                 rest_gpu_memory = available_gpu_memory - total_gpu_memory * (1 - self.mem_fraction_static)
@@ -1008,28 +1030,30 @@ class ModelRunner:
                 usable_cpu_bytes = int(total_cpu_memory * self.server_args.cpu_mem_fraction)
 
                 # Memory per request formula:
-                # GPU = full_attn_ctx * kv_per_layer * full_layers (exact)
-                #     + 2 * staging_tokens * kv_per_layer * sparse_layers (2x safety for LRU)
-                #     + ctx * landmark_per_token (sparse only)
-                # CPU = ctx * kv_per_layer * sparse_layers
+                # GPU = ctx * kv_per_layer * (full_layers + gpu_sparse_layers)  (full GPU KV)
+                #     + 2 * staging_tokens * kv_per_layer * cpu_sparse_layers (2x safety for LRU)
+                #     + ctx * landmark_per_token (all sparse layers)
+                # CPU = ctx * kv_per_layer * cpu_sparse_layers
                 #
                 # The 2x safety factor is applied ONLY to staging (for LRU collision avoidance),
-                # not to full attention layers which use standard paged KV cache.
+                # not to full attention or GPU sparse layers which use standard paged KV cache.
                 staging_safety_factor = 2
-                bytes_per_req_full_gpu = effective_context_len * kv_bytes_per_token_per_layer * num_full_layers
-                bytes_per_req_staging = staging_safety_factor * tokens_per_request_gpu * kv_bytes_per_token_per_layer * num_sparse_layers
+                bytes_per_req_full_gpu = effective_context_len * kv_bytes_per_token_per_layer * num_full_gpu_layers
+                bytes_per_req_staging = staging_safety_factor * tokens_per_request_gpu * kv_bytes_per_token_per_layer * num_cpu_sparse
                 bytes_per_req_landmark = effective_context_len * landmark_bytes_per_token
                 total_bytes_per_req_gpu = bytes_per_req_full_gpu + bytes_per_req_staging + bytes_per_req_landmark
 
-                bytes_per_req_cpu = effective_context_len * kv_bytes_per_token_per_layer * num_sparse_layers
+                bytes_per_req_cpu = effective_context_len * kv_bytes_per_token_per_layer * num_cpu_sparse
 
                 max_reqs_from_gpu = int(available_gpu_bytes / total_bytes_per_req_gpu) if total_bytes_per_req_gpu > 0 else 10000
-                # CPU memory is shared across all TP ranks, so divide by tp_size
-                total_bytes_per_req_cpu = bytes_per_req_cpu * self.tp_size
+                # CPU memory is shared across all TP ranks, so multiply by tp_size
+                # Also apply 2x safety factor for CUDA pinned memory overhead (~2x RSS observed)
+                pinned_memory_factor = 2
+                total_bytes_per_req_cpu = bytes_per_req_cpu * self.tp_size * pinned_memory_factor
                 max_reqs_from_cpu = int(usable_cpu_bytes / total_bytes_per_req_cpu) if total_bytes_per_req_cpu > 0 else 10000
 
                 # CPU must NOT be the bottleneck - if it is, error out
-                if max_reqs_from_cpu < max_reqs_from_gpu and num_sparse_layers > 0:
+                if max_reqs_from_cpu < max_reqs_from_gpu and num_cpu_sparse > 0:
                     raise ValueError(
                         f"CPU memory insufficient for CPU VTX backend. "
                         f"GPU can support {max_reqs_from_gpu} requests but CPU only {max_reqs_from_cpu}. "
@@ -1049,7 +1073,10 @@ class ModelRunner:
                     f"CPU VTX memory: max_reqs={max_reqs}, "
                     f"max_tokens_cpu={max_tokens_cpu}, max_tokens_gpu_staging={max_tokens_gpu_staging}, "
                     f"max_tokens_gpu_full={max_tokens_gpu_full}, "
-                    f"num_full_layers={num_full_layers}, num_sparse_layers={num_sparse_layers}, "
+                    f"full_attn_layers={len(self.full_attention_layer_ids)}, "
+                    f"gpu_sparse_layers={len(self.gpu_sparse_layer_ids)}, "
+                    f"cpu_sparse_layers={len(self.cpu_sparse_layer_ids)}, "
+                    f"cpu_percentage={cpu_percentage:.2f}, "
                     f"gpu_constraint={max_reqs_from_gpu}, cpu_constraint={max_reqs_from_cpu}, "
                     f"effective_context_len={effective_context_len}, tp_size={self.tp_size}, "
                     f"gpu_mem={rest_gpu_memory:.2f}GB, cpu_mem={usable_cpu_bytes/(1<<30):.2f}GB (shared across TP)"
@@ -1338,7 +1365,9 @@ class ModelRunner:
                     sparse_attention=self.sparse_attention,
                     memory_saver_adapter=self.memory_saver_adapter,
                     model_runner=self,
-                    layer_skip=self.server_args.vortex_layers_skip,
+                    full_attention_layer_ids=self.full_attention_layer_ids,
+                    gpu_sparse_layer_ids=self.gpu_sparse_layer_ids,
+                    cpu_sparse_layer_ids=self.cpu_sparse_layer_ids,
                     enable_custom_mem_pool=False,
                 )
             elif self.server_args.enable_vortex_sparsity:

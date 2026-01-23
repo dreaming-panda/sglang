@@ -117,7 +117,10 @@ class CPUVTXCGAttnBackend(AttentionBackend):
         # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.page_size = model_runner.server_args.page_size
-        self.layers_skip = model_runner.server_args.vortex_layers_skip
+        # Get layer classifications from model_runner
+        self.full_attention_layer_ids = set(getattr(model_runner, 'full_attention_layer_ids', []))
+        self.gpu_sparse_layer_ids = set(getattr(model_runner, 'gpu_sparse_layer_ids', []))
+        self.cpu_sparse_layer_ids = set(getattr(model_runner, 'cpu_sparse_layer_ids', list(range(model_runner.model_config.num_hidden_layers))))
 
         # ===========================
         # Prefill KV-indptr buffers
@@ -252,7 +255,15 @@ class CPUVTXCGAttnBackend(AttentionBackend):
         )
 
         # Decode wrappers - non-CUDA-graph versions for regular decode
+        # Wrapper 0: Dense attention
+        # Wrapper 1: CPU sparse attention (uses staging_kv_indices)
+        # Wrapper 2: GPU sparse attention (uses kv_indices_decode[1], like VTX graph backend)
         self.decode_wrappers = [
+            BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_tensor_cores=self.decode_use_tensor_cores,
+            ),
             BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
@@ -360,9 +371,10 @@ class CPUVTXCGAttnBackend(AttentionBackend):
                 kv_data_type=self.data_type,
             )
 
+            # Wrapper 1: CPU sparse (uses staging_kv_indices for staging slot IDs)
             self.decode_wrappers[1].plan(
                 indptr=self.kv_indptr_decode[1][:bs * self.num_kv_heads + 1],
-                indices=self.staging_kv_indices,  # Use staging_kv_indices (separate from kv_indices_decode[1])
+                indices=self.staging_kv_indices,
                 last_page_len=self.kv_last_page_len_decode[:bs * self.num_kv_heads],
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
@@ -372,7 +384,20 @@ class CPUVTXCGAttnBackend(AttentionBackend):
                 kv_data_type=self.data_type,
             )
 
-            self.forward_metadata = DecodeMetadata([self.decode_wrappers[0], self.decode_wrappers[1]])
+            # Wrapper 2: GPU sparse (uses kv_indices_decode[1] like VTX graph backend)
+            self.decode_wrappers[2].plan(
+                indptr=self.kv_indptr_decode[1][:bs * self.num_kv_heads + 1],
+                indices=self.kv_indices_decode[1],
+                last_page_len=self.kv_last_page_len_decode[:bs * self.num_kv_heads],
+                num_qo_heads=self.group_size,
+                num_kv_heads=1,
+                head_dim=self.head_dim,
+                page_size=self.page_size,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+            )
+
+            self.forward_metadata = DecodeMetadata([self.decode_wrappers[0], self.decode_wrappers[1], self.decode_wrappers[2]])
 
         elif forward_batch.forward_mode.is_extend():
             prefix_lens = forward_batch.extend_prefix_lens
@@ -450,6 +475,9 @@ class CPUVTXCGAttnBackend(AttentionBackend):
 
         if forward_mode.is_decode_or_idle():
             # Create CUDA graph-enabled decode wrappers with pre-allocated buffers
+            # Wrapper 0: Dense attention
+            # Wrapper 1: CPU sparse attention (uses staging_kv_indices)
+            # Wrapper 2: GPU sparse attention (uses kv_indices_decode[1])
             decode_wrappers = [
                 BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,
@@ -466,7 +494,16 @@ class CPUVTXCGAttnBackend(AttentionBackend):
                     use_cuda_graph=True,
                     use_tensor_cores=self.decode_use_tensor_cores,
                     paged_kv_indptr_buffer=self.kv_indptr_decode[1][:bs * self.num_kv_heads + 1],
-                    paged_kv_indices_buffer=self.staging_kv_indices,  # Separate buffer from kv_indices_decode[1]
+                    paged_kv_indices_buffer=self.staging_kv_indices,
+                    paged_kv_last_page_len_buffer=self.kv_last_page_len_decode[:bs * self.num_kv_heads],
+                ),
+                BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=True,
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                    paged_kv_indptr_buffer=self.kv_indptr_decode[1][:bs * self.num_kv_heads + 1],
+                    paged_kv_indices_buffer=self.kv_indices_decode[1],
                     paged_kv_last_page_len_buffer=self.kv_last_page_len_decode[:bs * self.num_kv_heads],
                 ),
             ]
@@ -491,9 +528,23 @@ class CPUVTXCGAttnBackend(AttentionBackend):
                 kv_data_type=self.data_type,
             )
 
+            # Wrapper 1: CPU sparse (uses staging_kv_indices)
             decode_wrappers[1].plan(
                 indptr=self.kv_indptr_decode[1][:bs * self.num_kv_heads + 1],
-                indices=self.staging_kv_indices,  # Use staging_kv_indices (separate from kv_indices_decode[1])
+                indices=self.staging_kv_indices,
+                last_page_len=self.kv_last_page_len_decode[:bs * self.num_kv_heads],
+                num_qo_heads=self.group_size,
+                num_kv_heads=1,
+                head_dim=self.head_dim,
+                page_size=self.page_size,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+            )
+
+            # Wrapper 2: GPU sparse (uses kv_indices_decode[1])
+            decode_wrappers[2].plan(
+                indptr=self.kv_indptr_decode[1][:bs * self.num_kv_heads + 1],
+                indices=self.kv_indices_decode[1],
                 last_page_len=self.kv_last_page_len_decode[:bs * self.num_kv_heads],
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
@@ -541,9 +592,23 @@ class CPUVTXCGAttnBackend(AttentionBackend):
             kv_data_type=self.data_type,
         )
 
+        # Wrapper 1: CPU sparse (uses staging_kv_indices)
         self.decode_cuda_graph_metadata[bs][1].plan(
             indptr=self.kv_indptr_decode[1][:bs * self.num_kv_heads + 1],
             indices=self.staging_kv_indices,
+            last_page_len=self.kv_last_page_len_decode[:bs * self.num_kv_heads],
+            num_qo_heads=self.group_size,
+            num_kv_heads=1,
+            head_dim=self.head_dim,
+            page_size=self.page_size,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
+        )
+
+        # Wrapper 2: GPU sparse (uses kv_indices_decode[1])
+        self.decode_cuda_graph_metadata[bs][2].plan(
+            indptr=self.kv_indptr_decode[1][:bs * self.num_kv_heads + 1],
+            indices=self.kv_indices_decode[1],
             last_page_len=self.kv_last_page_len_decode[:bs * self.num_kv_heads],
             num_qo_heads=self.group_size,
             num_kv_heads=1,
@@ -599,13 +664,26 @@ class CPUVTXCGAttnBackend(AttentionBackend):
                 self.num_kv_heads,
                 self.head_dim
             )
-            
-            k_cpu, v_cpu = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            k_cpu, v_cpu = k_cpu.view(-1, self.page_size, 1, self.head_dim), v_cpu.view(-1, self.page_size, 1, self.head_dim)
+
+            # Get KV buffers based on layer type
+            layer_type = forward_batch.token_to_kv_pool.get_layer_type(layer.layer_id)
+            if layer_type == 'cpu_sparse':
+                # CPU sparse: use CPU buffers
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            elif layer_type == 'gpu_sparse':
+                # GPU sparse: use GPU sparse cache
+                cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+                k_cache, v_cache = cache["k"], cache["v"]
+            else:  # full attention
+                # Full attention: use GPU full attention buffers
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer_gpu(layer.layer_id)
+
+            k_cache = k_cache.view(-1, self.page_size, 1, self.head_dim)
+            v_cache = v_cache.view(-1, self.page_size, 1, self.head_dim)
 
             o2, s2 = self.prefill_wrapper_paged.forward_return_lse(
                 q_t,
-                (k_cpu, v_cpu),
+                (k_cache, v_cache),
                 causal=False,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
@@ -639,21 +717,20 @@ class CPUVTXCGAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         """
-        Decode phase with sparse CPU->GPU transfer.
-
-        For CPU VTX CG backend:
-        1. Save current K/V to CPU
-        2. Use sparse attention indexer (CUDA graph compatible)
-        3. Copy sparse KV pages from CPU to GPU staging buffer (GPU kernel)
-        4. Run attention on GPU with staging buffer
+        Decode phase with three attention paths:
+        1. Full attention: dense attention on GPU KV
+        2. GPU sparse: sparse attention on GPU KV (like vtx_graph_backend)
+        3. CPU sparse: sparse attention with CPU->GPU staging copy
         """
         assert not layer.is_cross_attention
 
         cache_loc = forward_batch.out_cache_loc
         bs = len(forward_batch.req_pool_indices)
-        use_sparsity = (layer.layer_id not in self.layers_skip)
 
-        # Save new K/V to CPU cache
+        # Get layer type from pool
+        layer_type = forward_batch.token_to_kv_pool.get_layer_type(layer.layer_id)
+
+        # Save new K/V to appropriate cache
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -661,11 +738,11 @@ class CPUVTXCGAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        if use_sparsity:
-            # Prepare Q in grouped shape expected by sparse path
+        if layer_type == 'cpu_sparse':
+            # CPU sparse path: copy from CPU to GPU staging, then sparse attention
             q = q.view(-1, self.group_size, layer.head_dim).contiguous()
 
-            # Get cache for sparse indexing
+            # Get cache for sparse indexing (staging buffer with centroids)
             cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
 
             # Build sparse indices into paged KV buffers
@@ -677,7 +754,6 @@ class CPUVTXCGAttnBackend(AttentionBackend):
             )
 
             # Copy sparse KV from CPU to GPU staging buffer (GPU kernel - CG compatible)
-            # Read CPU page IDs from kv_indices_decode[1], write staging slots to staging_kv_indices
             result = forward_batch.token_to_kv_pool.copy_sparse_kv_to_gpu(
                 layer_id=layer.layer_id,
                 sparse_kv_indices=self.kv_indices_decode[1],
@@ -687,7 +763,7 @@ class CPUVTXCGAttnBackend(AttentionBackend):
             )
 
             k_staging, v_staging, _ = result
-            
+
             o = self.forward_metadata.decode_wrappers[1].forward(
                 q, (k_staging, v_staging),
                 sm_scale=layer.scaling,
@@ -696,17 +772,36 @@ class CPUVTXCGAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
             )
 
-        else:
-            # Dense attention path (for full attention layers in layer_skip)
-            # Save KV directly to GPU buffer
-            if k is not None:
-                assert v is not None
-                if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer_decode(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+        elif layer_type == 'gpu_sparse':
+            # GPU sparse path: pure sparse attention on GPU (like vtx_graph_backend)
+            q = q.view(-1, self.group_size, layer.head_dim).contiguous()
 
-            # Get GPU KV buffers directly for full attention
+            # Get cache for sparse indexing (GPU cache with centroids)
+            cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+
+            # Build sparse indices into kv_indices_decode[1] (same buffer as VTX graph backend)
+            self.sparse_attention.forward_indexer(
+                q=q,
+                o=self.kv_indices_decode[1],
+                cache=cache,
+                ctx=self.ctx
+            )
+
+            # Get GPU KV buffers
+            cache_k = cache["k"].view(-1, self.page_size, 1, self.head_dim)
+            cache_v = cache["v"].view(-1, self.page_size, 1, self.head_dim)
+
+            # Sparse attention on GPU using wrapper 2 (GPU sparse)
+            o = self.forward_metadata.decode_wrappers[2].forward(
+                q, (cache_k, cache_v),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+            )
+
+        else:  # full attention
+            # Dense attention path: full attention on GPU KV
             k_gpu, v_gpu = forward_batch.token_to_kv_pool.get_kv_buffer_gpu(layer.layer_id)
 
             o = self.forward_metadata.decode_wrappers[0].forward(
@@ -721,4 +816,5 @@ class CPUVTXCGAttnBackend(AttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
-        return 0 if layer.layer_id in self.layers_skip else 1
+        # Wrapper 0 = dense attention, Wrapper 1 = sparse attention
+        return 0 if layer.layer_id in self.full_attention_layer_ids else 1

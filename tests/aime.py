@@ -93,7 +93,8 @@ def main():
                         enable_cpu_vtx_cache=True,
                         vortex_module_name="block_sparse_attention",
                         vortex_max_seq_lens=-1,
-                        tp_size=4,
+                        vortex_cpu_percentage=0.8,
+                        tp_size=1,
                         log_level="debug",
                         crash_dump_folder=crash_dump_folder
                         )

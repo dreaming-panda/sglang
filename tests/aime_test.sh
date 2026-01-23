@@ -7,9 +7,9 @@ conda activate vortex
 cd ~/sglang/tests
 
 # Define parameter arrays
-MODEL_NAMES=("Qwen/Qwen3-8B" "Qwen/Qwen3-14B")
+MODEL_NAMES=("Qwen/Qwen3-32B")
 ATTENTION_BACKENDS=("cpu_vtx_flashinfer" "baseline" "flashinfer")
-MEM_FRACTIONS=(0.3 0.5)
+MEM_FRACTIONS=(0.5 0.7)
 MAX_NEW_TOKENS=(2048 4096 8192 16384)
 
 # Run all combinations
