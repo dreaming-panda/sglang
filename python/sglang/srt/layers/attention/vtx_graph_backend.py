@@ -115,7 +115,8 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.q_data_type = model_runner.dtype
         self.count = 0
         assert self.q_data_type == torch.bfloat16
-        self.is_quantized = (self.data_type == torch.int8)
+        self.is_int8 = (self.data_type == torch.int8)
+        self.is_fp8 = (self.data_type in (torch.float8_e4m3fn, torch.float8_e5m2))
 
         # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -242,7 +243,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                         backend="fa2",
                     )
 
-        if self.is_quantized:
+        if self.is_int8:
             # Int8 path: no FlashInfer decode wrappers; use custom Triton kernels
             self.decode_wrappers = None
             self.max_kv_splits_decode = 8
@@ -364,7 +365,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 ctx=self.ctx
             )
 
-            if self.is_quantized:
+            if self.is_int8:
                 # Int8 path: no FlashInfer decode wrappers needed
                 self.forward_metadata = DecodeMetadata(decode_wrappers=None)
             else:
@@ -425,7 +426,8 @@ class VTXGraphAttnBackend(AttentionBackend):
             )
             
             # For int8: plan paged prefill with bf16 dtype (pages will be dequantized to bf16)
-            paged_kv_dtype = torch.bfloat16 if self.is_quantized else self.data_type
+            # For fp8: FlashInfer handles fp8 natively, so use self.data_type directly
+            paged_kv_dtype = torch.bfloat16 if self.is_int8 else self.data_type
             self.prefill_wrapper_paged.plan(
                 self.qo_indptr[1][:bs*self.num_kv_heads+1],
                 self.kv_indptr_prefill[:bs*self.num_kv_heads+1],
@@ -481,7 +483,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 ctx=self.ctx
             )
 
-            if self.is_quantized:
+            if self.is_int8:
                 # Int8 path: no FlashInfer decode wrappers
                 self.decode_cuda_graph_metadata[bs] = None
                 self.forward_metadata = DecodeMetadata(decode_wrappers=None)
@@ -563,7 +565,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 ctx=self.ctx
             )
 
-        if self.is_quantized:
+        if self.is_int8:
             # Int8 path: plan_decode already filled indptr/indices; no FlashInfer plan needed
             pass
         else:
@@ -643,7 +645,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 self.head_dim
             )
 
-            if self.is_quantized:
+            if self.is_int8:
                 # Int8 prefill fallback: dequantize only accessed pages to compact bf16
                 cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
                 pool = forward_batch.token_to_kv_pool
@@ -699,8 +701,13 @@ class VTXGraphAttnBackend(AttentionBackend):
                 )
             else:
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                k_cache = k_cache.view(-1, self.page_size, 1, self.head_dim)
-                v_cache = v_cache.view(-1, self.page_size, 1, self.head_dim)
+                if self.is_fp8:
+                    # uint8 storage → view as native fp8 dtype for FlashInfer
+                    k_cache = k_cache.view(self.data_type).view(-1, self.page_size, 1, self.head_dim)
+                    v_cache = v_cache.view(self.data_type).view(-1, self.page_size, 1, self.head_dim)
+                else:
+                    k_cache = k_cache.view(-1, self.page_size, 1, self.head_dim)
+                    v_cache = v_cache.view(-1, self.page_size, 1, self.head_dim)
                 o2, s2 = self.prefill_wrapper_paged.forward_return_lse(
                     q_t,
                     (k_cache, v_cache),
@@ -803,7 +810,7 @@ class VTXGraphAttnBackend(AttentionBackend):
         # Decide whether to use sparsity on this layer
         use_sparsity = (layer.layer_id not in self.layers_skip)
 
-        if self.is_quantized:
+        if self.is_int8:
             # ---- Int8 decode path ----
             if use_sparsity:
                 q_grouped = q.view(-1, self.group_size, layer.head_dim).contiguous()
@@ -828,9 +835,14 @@ class VTXGraphAttnBackend(AttentionBackend):
                     bs=bs,
                 )
         else:
-            # ---- bf16 decode path (FlashInfer) ----
-            cache_k = cache["k"].view(-1, self.page_size, 1, self.head_dim)
-            cache_v = cache["v"].view(-1, self.page_size, 1, self.head_dim)
+            # ---- bf16/fp8 decode path (FlashInfer) ----
+            if self.is_fp8:
+                # uint8 storage → view as native fp8 dtype for FlashInfer
+                cache_k = cache["k"].view(self.data_type).view(-1, self.page_size, 1, self.head_dim)
+                cache_v = cache["v"].view(self.data_type).view(-1, self.page_size, 1, self.head_dim)
+            else:
+                cache_k = cache["k"].view(-1, self.page_size, 1, self.head_dim)
+                cache_v = cache["v"].view(-1, self.page_size, 1, self.head_dim)
 
             if use_sparsity:
                 # Prepare Q in grouped shape expected by sparse path

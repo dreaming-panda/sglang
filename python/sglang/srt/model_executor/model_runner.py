@@ -958,7 +958,6 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         elif self.server_args.enable_vortex_sparsity:
-<<<<<<< HEAD
             # For vortex: calculate based on GPU staging buffer + landmark buffer
             num_kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
 
@@ -1088,15 +1087,25 @@ class ModelRunner:
                 head_dim = self.model_config.head_dim
                 token_ratio = self.sparse_attention.get_token_ratio(self.page_size, head_dim)
                 if self.kv_cache_dtype == torch.int8:
-                    # Int8 KV cache: account for int8 k/v, fp16 scales, bf16 shadow K,
-                    # and bf16 custom caches (centroids, etc.)
-                    bytes_kv = head_dim * 1 * 2           # int8 K + V
-                    bytes_scales = 2 * 2                  # fp16 scales for K + V
-                    bytes_shadow_k = head_dim * 2         # bf16 shadow K working buffer
-                    bytes_per_token_per_head = bytes_kv + bytes_scales + bytes_shadow_k
-                    # Custom caches (token_ratio - 2.0 accounts for non-k/v caches) in bf16
+                    # Per-layer per-token per-head costs
+                    bytes_kv = head_dim * 1 * 2           # int8 K + V (1 byte each)
+                    bytes_scales = 2 * 2                  # fp16 K + V scales
                     custom_ratio = token_ratio - 2.0
-                    bytes_custom = int(head_dim * custom_ratio * 2)  # bf16
+                    bytes_custom = int(head_dim * custom_ratio * 2)  # bf16 custom caches
+                    per_layer_per_head = bytes_kv + bytes_scales + bytes_custom
+
+                    # Shared buffers (NOT per-layer): _k_bf16_working, prefill_k_workspace, prefill_v_workspace
+                    # Each is bf16, shape (num_pages, page_size, head_dim) -> head_dim * 2 bytes per token per head
+                    shared_per_head = head_dim * 2 * 3    # 3 shared bf16 buffers
+
+                    cell_size = num_kv_heads * (per_layer_per_head * num_layers + shared_per_head)
+                elif self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    # FP8 KV cache: fp8 k/v (1 byte each), no scale buffers, no shadow buffer.
+                    # Custom caches (centroids, max, min) stored as bf16.
+                    bytes_kv = head_dim * 1 * 2           # fp8 K + V (1 byte each)
+                    bytes_per_token_per_head = bytes_kv
+                    custom_ratio = token_ratio - 2.0
+                    bytes_custom = int(head_dim * custom_ratio * 2)  # bf16 custom caches
                     cell_size = num_kv_heads * (bytes_per_token_per_head + bytes_custom) * num_layers
                 else:
                     cell_size = (
