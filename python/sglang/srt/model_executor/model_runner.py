@@ -958,12 +958,24 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         elif self.server_args.enable_vortex_sparsity:
-            
-            cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * self.model_config.head_dim
-                    * num_layers
-                    * self.sparse_attention.get_token_ratio(self.page_size, self.model_config.head_dim)
+            num_kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            head_dim = self.model_config.head_dim
+            token_ratio = self.sparse_attention.get_token_ratio(self.page_size, head_dim)
+            if self.kv_cache_dtype == torch.int8:
+                # Int8 KV cache: account for int8 k/v, fp16 scales, bf16 shadow K,
+                # and bf16 custom caches (centroids, etc.)
+                bytes_kv = head_dim * 1 * 2           # int8 K + V
+                bytes_scales = 2 * 2                  # fp16 scales for K + V
+                bytes_shadow_k = head_dim * 2         # bf16 shadow K working buffer
+                bytes_per_token_per_head = bytes_kv + bytes_scales + bytes_shadow_k
+                # Custom caches (token_ratio - 2.0 accounts for non-k/v caches) in bf16
+                custom_ratio = token_ratio - 2.0
+                bytes_custom = int(head_dim * custom_ratio * 2)  # bf16
+                cell_size = num_kv_heads * (bytes_per_token_per_head + bytes_custom) * num_layers
+            else:
+                cell_size = (
+                    num_kv_heads * head_dim * num_layers
+                    * token_ratio
                     * torch._utils._element_size(self.kv_cache_dtype)
                 )
         else:
