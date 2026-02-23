@@ -28,6 +28,7 @@ from sglang.srt.utils import (
 
 import vortex_torch
 from vortex_torch.abs import as_vtensor, FORMAT
+from vortex_torch.cache.triton_kernels.paged_prefill_int8 import dequant_paged_int8_to_bf16_inplace
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -154,14 +155,16 @@ class VTXGraphCachePool(KVCache):
                                     device=self.device,
                                 )
                         # Per-token scale buffers: shape [num_pages, page_size, 1]
+                        # Use float16 to halve memory and bandwidth; precision is
+                        # sufficient for absmax scales (values are small positive floats).
                         layer_cache["k_scale"] = torch.zeros(
                             (self.num_pages, self.page_size, 1),
-                            dtype=torch.float32,
+                            dtype=torch.float16,
                             device=self.device,
                         )
                         layer_cache["v_scale"] = torch.zeros(
                             (self.num_pages, self.page_size, 1),
-                            dtype=torch.float32,
+                            dtype=torch.float16,
                             device=self.device,
                         )
                         self.cache.append(layer_cache)
@@ -171,6 +174,19 @@ class VTXGraphCachePool(KVCache):
                     k_shape = self.cache_meta_info["k"]
                     self._k_bf16_working = torch.zeros(
                         (self.num_pages, k_shape[0], k_shape[1]),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    # Pre-allocated prefill workspaces: reused each prefill call
+                    # to avoid dynamic allocation of large bf16 buffers.
+                    # Sized to num_pages (upper bound for any single prefill).
+                    self.prefill_k_workspace = torch.empty(
+                        (self.num_pages, self.page_size, self.head_dim),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    self.prefill_v_workspace = torch.empty(
+                        (self.num_pages, self.page_size, self.head_dim),
                         dtype=torch.bfloat16,
                         device=self.device,
                     )
@@ -306,14 +322,32 @@ class VTXGraphCachePool(KVCache):
                 loc,
                 self.page_size
             )
-            # Write bf16 K to shared working buffer for forward_cache ops
-            vortex_torch.cache.set_kv_buffer_launcher(
+            # Dequantize ENTIRE affected pages from authoritative int8 cache
+            # into _k_bf16_working so forward_cache sees all tokens (not just
+            # the newly written one). This is critical for correct centroid
+            # computation — CMean operates over the full page.
+            token_page_ids = loc // self.page_size  # logical page per token
+            # torch.unique forces CPU-GPU sync (dynamic output shape), which is
+            # forbidden during CUDA graph capture. During decode (the only phase
+            # captured), each sequence processes 1 token so page IDs are already
+            # unique — skip the dedup.
+            if torch.cuda.is_current_stream_capturing():
+                unique_page_ids = token_page_ids
+            else:
+                unique_page_ids = torch.unique(token_page_ids)
+            # Map logical pages to flat page IDs for all KV heads:
+            # flat_page_id = page_id * num_kv_heads + head_id
+            flat_page_ids = (
+                unique_page_ids[:, None] * self.head_num
+                + torch.arange(self.head_num, device=loc.device)[None, :]
+            ).reshape(-1)
+            dequant_paged_int8_to_bf16_inplace(
+                layer_cache["k"],
+                layer_cache["k_scale"],
                 self._k_bf16_working,
-                self._k_bf16_working,  # v unused by forward_cache, reuse buffer
-                cache_k_contig,
-                cache_k_contig,         # write K to both slots (v slot is dummy)
-                loc,
-                self.page_size
+                flat_page_ids.to(torch.int32),
+                self.page_size,
+                self.head_dim,
             )
             # Build cache view for forward_cache with bf16 K
             cache_for_forward = {k: v for k, v in layer_cache.items()}

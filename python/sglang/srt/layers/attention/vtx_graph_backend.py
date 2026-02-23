@@ -252,6 +252,17 @@ class VTXGraphAttnBackend(AttentionBackend):
                 (max_batch_kv_heads,), self.max_kv_splits_decode,
                 dtype=torch.int32, device=model_runner.device
             )
+            # Pre-allocate intermediate buffers for decode split reduction
+            self.att_out_buf = torch.empty(
+                (max_batch_kv_heads, self.num_qo_heads // self.num_kv_heads,
+                 self.max_kv_splits_decode, self.head_dim),
+                dtype=torch.float32, device=model_runner.device,
+            )
+            self.att_lse_buf = torch.empty(
+                (max_batch_kv_heads, self.num_qo_heads // self.num_kv_heads,
+                 self.max_kv_splits_decode),
+                dtype=torch.float32, device=model_runner.device,
+            )
         else:
             self.decode_wrappers = [
                 BatchDecodeWithPagedKVCacheWrapper(
@@ -635,6 +646,7 @@ class VTXGraphAttnBackend(AttentionBackend):
             if self.is_quantized:
                 # Int8 prefill fallback: dequantize only accessed pages to compact bf16
                 cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+                pool = forward_batch.token_to_kv_pool
                 bs = len(forward_batch.req_pool_indices)
                 num_batch_kv = bs * self.num_kv_heads
 
@@ -642,14 +654,16 @@ class VTXGraphAttnBackend(AttentionBackend):
                 total_pages = int(self.kv_indptr_prefill[num_batch_kv].item())
                 accessed_page_ids = self.kv_indices_prefill[:total_pages]
 
-                # Dequantize only accessed K/V pages to compact bf16 buffers
+                # Dequantize into pre-allocated workspaces (avoids dynamic allocation)
                 k_cache_bf16 = dequant_paged_int8_to_bf16(
                     cache["k"], cache["k_scale"],
                     accessed_page_ids, self.page_size, self.head_dim,
+                    out=pool.prefill_k_workspace,
                 )
                 v_cache_bf16 = dequant_paged_int8_to_bf16(
                     cache["v"], cache["v_scale"],
                     accessed_page_ids, self.page_size, self.head_dim,
+                    out=pool.prefill_v_workspace,
                 )
 
                 # Remap indices: FlashInfer will use compacted indices [0, 1, 2, ...]
@@ -749,6 +763,8 @@ class VTXGraphAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
             page_size=self.page_size,
             logit_cap=layer.logit_cap if layer.logit_cap is not None else 0.0,
+            att_out=self.att_out_buf[:num_batch_kv],
+            att_lse=self.att_lse_buf[:num_batch_kv],
         )
 
         return o
