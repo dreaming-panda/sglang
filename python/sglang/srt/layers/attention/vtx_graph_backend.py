@@ -9,9 +9,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 
 import os
 from dataclasses import dataclass
-from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Union, Dict, Tuple
-from functools import partial
+from typing import TYPE_CHECKING, List, Optional, Union, Dict, Tuple
 import torch
 import vortex_torch
 from vortex_torch.abs import as_vtensor, FORMAT
@@ -38,11 +36,9 @@ if TYPE_CHECKING:
 if is_flashinfer_available():
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
-        BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _get_range_buf, get_seq_lens
 
 @dataclass
 class DecodeMetadata:
@@ -124,16 +120,6 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.layers_skip = model_runner.server_args.vortex_layers_skip
 
         # ===========================
-        # Prefill KV-indptr buffers
-        # ===========================
-
-        self.kv_indptr_prefill = torch.zeros(
-            (max_bs * self.num_kv_heads + 1,),
-            dtype=torch.int32,
-            device=model_runner.device
-        )
-
-        # ===========================
         # Decode KV-indptr buffers
         # ===========================
 
@@ -149,19 +135,6 @@ class VTXGraphAttnBackend(AttentionBackend):
                 device=model_runner.device
             ),
         ]
-
-        # ===========================
-        # KV indices (prefill)
-        # ===========================
-
-        self.kv_indices_prefill = torch.zeros(
-            (
-                (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1)
-                // self.page_size,
-            ),
-            dtype=torch.int32,
-            device=model_runner.device
-        )
 
         # ===========================
         # KV indices (decode)
@@ -190,12 +163,6 @@ class VTXGraphAttnBackend(AttentionBackend):
         # KV last page length tracking
         # ===========================
 
-        self.kv_last_page_len_prefill = torch.ones(
-            (max_bs * self.num_kv_heads,),
-            dtype=torch.int32,
-            device=model_runner.device
-        )
-
         self.kv_last_page_len_decode = torch.ones(
             (max_bs * self.num_kv_heads,),
             dtype=torch.int32,
@@ -203,32 +170,44 @@ class VTXGraphAttnBackend(AttentionBackend):
         )
 
         # ===========================
-        # Query/Output indptr buffers
+        # Query/Output indptr buffer (ragged only)
         # ===========================
 
-        self.qo_indptr = [
-            torch.zeros(
-                (max_bs + 1,),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-            torch.zeros(
-                (max_bs * self.num_kv_heads + 1,),
-                dtype=torch.int32,
-                device=model_runner.device
-            ),
-        ]
-
-        # ===========================
-        # Batch table (token-level mapping)
-        # ===========================
-
-        self.batch_table = torch.zeros(
-            (model_runner.server_args.max_prefill_tokens,),
-            dtype=torch.uint16,
+        self.qo_indptr = torch.zeros(
+            (max_bs + 1,),
+            dtype=torch.int32,
             device=model_runner.device
         )
 
+        # ===========================
+        # Sparse prefill buffers
+        # ===========================
+
+        topk_budget = (
+            model_runner.server_args.vortex_topk_val
+            + model_runner.server_args.vortex_page_reserved_bos
+            + model_runner.server_args.vortex_page_reserved_eos
+        )
+        max_sparse_tokens = max_bs * topk_budget * self.page_size
+        self.sparse_prefill_k_buf = torch.empty(
+            (max_sparse_tokens, self.num_kv_heads, self.head_dim),
+            dtype=torch.bfloat16,
+            device=model_runner.device,
+        )
+        self.sparse_prefill_v_buf = torch.empty(
+            (max_sparse_tokens, self.num_kv_heads, self.head_dim),
+            dtype=torch.bfloat16,
+            device=model_runner.device,
+        )
+        self.sparse_prefill_kv_indptr = torch.zeros(
+            (max_bs + 1,),
+            dtype=torch.int32,
+            device=model_runner.device,
+        )
+
+        # ===========================
+        # Prefill wrappers (ragged only)
+        # ===========================
 
         fmha_backend = "auto"
         if is_sm100_supported():
@@ -236,12 +215,9 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
-
-        self.prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend="fa2",
-                    )
+        self.prefill_wrapper_ragged_sparse = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD", backend=fmha_backend
+        )
 
         if self.is_int8:
             # Int8 path: no FlashInfer decode wrappers; use custom Triton kernels
@@ -395,54 +371,34 @@ class VTXGraphAttnBackend(AttentionBackend):
                 self.forward_metadata = DecodeMetadata([self.decode_wrappers[0], self.decode_wrappers[1]])
         
         elif forward_batch.forward_mode.is_extend():
-            
+
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             bs = len(forward_batch.req_pool_indices)
-            
-            vortex_torch.indexer.utils_sglang.plan_prefill(
-                cached_seq_lens=prefix_lens,
-                dense_kv_indptr=self.kv_indptr_prefill[:bs*self.num_kv_heads+1],
-                dense_kv_indices=self.kv_indices_prefill,
-                input_seq_lens=(forward_batch.seq_lens.to(torch.int32) - prefix_lens),
-                qo_indptr_ragged=self.qo_indptr[0][:bs+1],
-                qo_indptr_paged=self.qo_indptr[1][:bs*self.num_kv_heads+1],
-                kv_last_page_len=self.kv_last_page_len_prefill[:bs*self.num_kv_heads],
-                req_to_token=self.req_to_token,
-                req_indices=forward_batch.req_pool_indices,
-                batch_table=self.batch_table,
-                page_size=self.page_size,
-                num_kv_heads=self.num_kv_heads
-            )
-            
-   
+            input_seq_lens = forward_batch.seq_lens.to(torch.int32) - prefix_lens
+
+            # Compute qo_indptr for ragged self-attention (cumsum of input_seq_lens)
+            self.qo_indptr[0] = 0
+            torch.cumsum(input_seq_lens, dim=0, out=self.qo_indptr[1:bs+1])
+
+            # Plan ragged wrapper for causal self-attention on new tokens
             self.prefill_wrapper_ragged.plan(
-                self.qo_indptr[0][:bs+1],
-                self.qo_indptr[0][:bs+1],
+                self.qo_indptr[:bs+1],
+                self.qo_indptr[:bs+1],
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
-            
-            # For int8: plan paged prefill with bf16 dtype (pages will be dequantized to bf16)
-            # For fp8: FlashInfer handles fp8 natively, so use self.data_type directly
-            paged_kv_dtype = torch.bfloat16 if self.is_int8 else self.data_type
-            self.prefill_wrapper_paged.plan(
-                self.qo_indptr[1][:bs*self.num_kv_heads+1],
-                self.kv_indptr_prefill[:bs*self.num_kv_heads+1],
-                self.kv_indices_prefill,
-                self.kv_last_page_len_prefill[:bs*self.num_kv_heads],
-                self.group_size,
-                1,
-                self.head_dim,
-                self.page_size,
-                q_data_type=self.q_data_type,
-                kv_data_type=paged_kv_dtype,
-                custom_mask=None,
-                non_blocking=True,
-            )
-            
+
+            # If cached prefix exists, prepare decode-style indices for the indexer
+            if not extend_no_prefix:
+                vortex_torch.indexer.utils_sglang.plan_decode(
+                    cached_seq_lens=prefix_lens,
+                    req_to_token=self.req_to_token,
+                    req_indices=forward_batch.req_pool_indices,
+                    ctx=self.ctx
+                )
 
             self.forward_metadata = PrefillMetadata(extend_no_prefix)
 
@@ -610,129 +566,207 @@ class VTXGraphAttnBackend(AttentionBackend):
         assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
-
         logits_soft_cap = layer.logit_cap
-
         q = q.contiguous()
 
-        if self.forward_metadata.extend_no_prefix:
-            # Self-attention on new tokens only — always bf16, no cache access
-            o = self.prefill_wrapper_ragged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
-
-        else:
-            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-                )
-
-            q_t = vortex_torch.indexer.utils_sglang.chunkwise_nh2hn_transpose(
-                q.view(-1, self.num_qo_heads, self.head_dim),
-                self.qo_indptr[0],
-                self.batch_table,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim
-            )
-
-            if self.is_int8:
-                # Int8 prefill fallback: dequantize only accessed pages to compact bf16
-                cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
-                pool = forward_batch.token_to_kv_pool
-                bs = len(forward_batch.req_pool_indices)
-                num_batch_kv = bs * self.num_kv_heads
-
-                # Extract unique accessed page indices from kv_indices_prefill
-                total_pages = int(self.kv_indptr_prefill[num_batch_kv].item())
-                accessed_page_ids = self.kv_indices_prefill[:total_pages]
-
-                # Dequantize into pre-allocated workspaces (avoids dynamic allocation)
-                k_cache_bf16 = dequant_paged_int8_to_bf16(
-                    cache["k"], cache["k_scale"],
-                    accessed_page_ids, self.page_size, self.head_dim,
-                    out=pool.prefill_k_workspace,
-                )
-                v_cache_bf16 = dequant_paged_int8_to_bf16(
-                    cache["v"], cache["v_scale"],
-                    accessed_page_ids, self.page_size, self.head_dim,
-                    out=pool.prefill_v_workspace,
-                )
-
-                # Remap indices: FlashInfer will use compacted indices [0, 1, 2, ...]
-                compacted_indices = torch.arange(
-                    total_pages, dtype=torch.int32, device=q.device
-                )
-
-                # Re-plan FlashInfer paged wrapper with compacted indices
-                self.prefill_wrapper_paged.plan(
-                    self.qo_indptr[1][:num_batch_kv + 1],
-                    self.kv_indptr_prefill[:num_batch_kv + 1],
-                    compacted_indices,
-                    self.kv_last_page_len_prefill[:num_batch_kv],
-                    self.group_size,
-                    1,
-                    self.head_dim,
-                    self.page_size,
-                    q_data_type=self.q_data_type,
-                    kv_data_type=torch.bfloat16,
-                    custom_mask=None,
-                    non_blocking=False,
-                )
-
-                k_cache_bf16 = k_cache_bf16.view(-1, self.page_size, 1, self.head_dim)
-                v_cache_bf16 = v_cache_bf16.view(-1, self.page_size, 1, self.head_dim)
-
-                o2, s2 = self.prefill_wrapper_paged.forward_return_lse(
-                    q_t,
-                    (k_cache_bf16, v_cache_bf16),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
-            else:
-                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                if self.is_fp8:
-                    # uint8 storage → view as native fp8 dtype for FlashInfer
-                    k_cache = k_cache.view(self.data_type).view(-1, self.page_size, 1, self.head_dim)
-                    v_cache = v_cache.view(self.data_type).view(-1, self.page_size, 1, self.head_dim)
-                else:
-                    k_cache = k_cache.view(-1, self.page_size, 1, self.head_dim)
-                    v_cache = v_cache.view(-1, self.page_size, 1, self.head_dim)
-                o2, s2 = self.prefill_wrapper_paged.forward_return_lse(
-                    q_t,
-                    (k_cache, v_cache),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
-
-            o2_t, s2_t = vortex_torch.indexer.utils_sglang.chunkwise_hn2nh_transpose(
-                o2,  s2,
-                self.qo_indptr[0],
-                self.batch_table,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim
-            )
-
-            o, _ = merge_state(o1, s1, o2_t, s2_t)
-
+        # Save KV to cache FIRST so centroids are available for topK scoring
         if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        q_view = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        k_view = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+        v_view = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+
+        if self.forward_metadata.extend_no_prefix:
+            # No cached prefix: self-attention only (dense, causal)
+            o = self.prefill_wrapper_ragged.forward(
+                q_view, k_view, v_view,
+                causal=True,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+        else:
+            # Has cached prefix: self-attn on new tokens + sparse cross-attn against prefix
+
+            # Stage 1: Self-attention on new tokens (causal)
+            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                q_view, k_view, v_view,
+                causal=True,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+
+            # Stage 2: Sparse cross-attention against cached prefix (ragged)
+            bs = len(forward_batch.req_pool_indices)
+            use_sparsity = (layer.layer_id not in self.layers_skip)
+            cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+
+            if use_sparsity:
+                # Compute per-request Q summary for page scoring
+                q_summary = self._compute_query_summary(q_view, bs)
+                # Run forward_indexer -> topK page selection
+                self.sparse_attention.forward_indexer(
+                    q=q_summary,
+                    o=self.kv_indices_decode[1],
+                    cache=cache,
+                    ctx=self.ctx
                 )
+                # Gather selected pages into ragged KV buffer
+                total_tokens = self._gather_pages_to_ragged(cache, bs, sparse=True)
+            else:
+                # Dense: gather ALL prefix pages
+                total_tokens = self._gather_pages_to_ragged(cache, bs, sparse=False)
+
+            # Plan sparse ragged wrapper for cross-attention
+            self.prefill_wrapper_ragged_sparse.plan(
+                self.qo_indptr[:bs+1],
+                self.sparse_prefill_kv_indptr[:bs+1],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                q_data_type=self.q_data_type,
+            )
+
+            # Cross-attention (non-causal: all prefix tokens precede new tokens)
+            o2, s2 = self.prefill_wrapper_ragged_sparse.forward_return_lse(
+                q_view,
+                self.sparse_prefill_k_buf[:total_tokens],
+                self.sparse_prefill_v_buf[:total_tokens],
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+
+            # Stage 3: Merge self-attention and cross-attention
+            o, _ = merge_state(o1, s1, o2, s2)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _compute_query_summary(self, q_view: torch.Tensor, bs: int) -> torch.Tensor:
+        """
+        Compute per-request mean Q, shaped for the indexer API.
+
+        Args:
+            q_view: [total_tokens, num_qo_heads, head_dim]
+            bs: batch size
+
+        Returns:
+            [bs * num_kv_heads, group_size, head_dim] tensor
+        """
+        qo_indptr = self.qo_indptr[:bs + 1]
+        total_tokens = int(qo_indptr[bs].item())
+
+        # Build segment IDs from qo_indptr for scatter_add
+        seg_ids = torch.zeros(total_tokens, dtype=torch.int64, device=q_view.device)
+        for i in range(bs):
+            start = int(qo_indptr[i].item())
+            end = int(qo_indptr[i + 1].item())
+            seg_ids[start:end] = i
+
+        # Scatter-add then divide by count for per-request mean
+        summaries = torch.zeros(
+            bs, self.num_qo_heads, self.head_dim,
+            device=q_view.device, dtype=q_view.dtype
+        )
+        summaries.scatter_add_(
+            0,
+            seg_ids.unsqueeze(-1).unsqueeze(-1).expand_as(q_view),
+            q_view,
+        )
+        counts = (qo_indptr[1:bs + 1] - qo_indptr[:bs]).float().unsqueeze(-1).unsqueeze(-1)
+        summaries = (summaries / counts.clamp(min=1)).to(q_view.dtype)
+
+        # Reshape: [bs, num_kv_heads, group_size, head_dim] -> [bs*num_kv_heads, group_size, head_dim]
+        summaries = summaries.view(bs, self.num_kv_heads, self.group_size, self.head_dim)
+        return summaries.reshape(bs * self.num_kv_heads, self.group_size, self.head_dim).contiguous()
+
+    def _gather_pages_to_ragged(
+        self,
+        cache: Dict[str, torch.Tensor],
+        bs: int,
+        sparse: bool = True,
+    ) -> int:
+        """
+        Gather paged KV into contiguous ragged buffers for the ragged wrapper.
+
+        Uses sparse_kv_indptr/indices (topK selected) or dense_kv_indptr/indices (all pages)
+        from self.ctx. Writes into self.sparse_prefill_k_buf, sparse_prefill_v_buf,
+        and sparse_prefill_kv_indptr.
+
+        Args:
+            cache: layer cache dict with "k", "v" (and "k_scale", "v_scale" for int8)
+            bs: batch size
+            sparse: if True use sparse indices (topK), else use dense indices (all)
+
+        Returns:
+            total number of KV tokens written to the ragged buffer
+        """
+        if sparse:
+            kv_indptr = self.ctx.sparse_kv_indptr
+            kv_indices = self.ctx.sparse_kv_indices
+        else:
+            kv_indptr = self.ctx.dense_kv_indptr
+            kv_indices = self.ctx.dense_kv_indices
+
+        num_batch_kv = bs * self.num_kv_heads
+        total_pages = int(kv_indptr[num_batch_kv].item())
+
+        if total_pages == 0:
+            self.sparse_prefill_kv_indptr[:bs + 1] = 0
+            return 0
+
+        selected_page_ids = kv_indices[:total_pages]
+
+        # Gather pages from paged cache, handling dtype
+        if self.is_int8:
+            gathered_k = dequant_paged_int8_to_bf16(
+                cache["k"], cache["k_scale"],
+                selected_page_ids, self.page_size, self.head_dim,
+            )
+            gathered_v = dequant_paged_int8_to_bf16(
+                cache["v"], cache["v_scale"],
+                selected_page_ids, self.page_size, self.head_dim,
+            )
+            # gathered shape: [total_pages, page_size, head_dim]
+        elif self.is_fp8:
+            gathered_k = cache["k"][selected_page_ids].view(self.data_type).to(torch.bfloat16)
+            gathered_v = cache["v"][selected_page_ids].view(self.data_type).to(torch.bfloat16)
+        else:
+            gathered_k = cache["k"][selected_page_ids]  # [total_pages, page_size, head_dim]
+            gathered_v = cache["v"][selected_page_ids]
+
+        # Flatten pages to tokens: [total_pages * page_size, head_dim]
+        flat_k = gathered_k.reshape(-1, self.head_dim)
+        flat_v = gathered_v.reshape(-1, self.head_dim)
+
+        # Reassemble per-head pages into multi-head ragged layout:
+        # Pages are stored per-head (page_p_head_h = p * num_kv_heads + h).
+        # kv_indptr groups pages as [req0_head0, req0_head1, ..., req1_head0, ...].
+        # Ragged wrapper expects [total_tokens, num_kv_heads, head_dim] with
+        # kv_indptr [bs+1] giving per-request token counts.
+        offset = 0
+        self.sparse_prefill_kv_indptr[0] = 0
+        for i in range(bs):
+            # All heads of request i have the same page count
+            head0_start = int(kv_indptr[i * self.num_kv_heads].item())
+            head0_end = int(kv_indptr[i * self.num_kv_heads + 1].item())
+            pages_per_head = head0_end - head0_start
+            tokens_per_request = pages_per_head * self.page_size
+
+            for h in range(self.num_kv_heads):
+                h_start = int(kv_indptr[i * self.num_kv_heads + h].item())
+                h_end = int(kv_indptr[i * self.num_kv_heads + h + 1].item())
+                src_start = h_start * self.page_size
+                src_end = h_end * self.page_size
+                self.sparse_prefill_k_buf[offset:offset + tokens_per_request, h, :] = flat_k[src_start:src_end]
+                self.sparse_prefill_v_buf[offset:offset + tokens_per_request, h, :] = flat_v[src_start:src_end]
+
+            offset += tokens_per_request
+            self.sparse_prefill_kv_indptr[i + 1] = offset
+
+        return offset
 
     def _forward_decode_int8(
         self,

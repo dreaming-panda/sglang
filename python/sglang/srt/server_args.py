@@ -200,6 +200,7 @@ class ServerArgs:
     vortex_lb_max_chunk_size: int = 32
     vortex_lb_min_chunk_size: int = 8
     vortex_indexer_dtype: str = "bfloat16"
+    vortex_topk_type: str = "naive"
     vortex_module_path: str = None
     vortex_module_name: str = None
 
