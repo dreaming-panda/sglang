@@ -193,6 +193,7 @@ class ServerArgs:
     vortex_page_reserved_bos: int = 1
     vortex_page_reserved_eos: int = 1
     enable_cpu_vtx_cache: bool = False  # Enable LRU cache for CPU VTX staging buffer
+    vortex_alloc_kernel: str = "lru_block_global"  # Allocation kernel: "lru_block", "lru_global", or "lru_block_global"
     vortex_profile: bool = False
     vortex_cg: bool = False
     vortex_max_seq_lens: int = -1
@@ -201,8 +202,8 @@ class ServerArgs:
     vortex_indexer_dtype: str = "bfloat16"
     vortex_module_path: str = None
     vortex_module_name: str = None
-    
-    
+
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
@@ -410,6 +411,12 @@ class ServerArgs:
         if self.attention_backend == "torch_native":
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
+            )
+            self.disable_cuda_graph = True
+
+        if self.vortex_profile:
+            logger.warning(
+                "Cuda graph is disabled because vortex profiling is enabled"
             )
             self.disable_cuda_graph = True
 
@@ -1762,8 +1769,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.vortex_module_name,
         )
-        
-        
+        parser.add_argument(
+            "--vortex-alloc-kernel",
+            type=str,
+            choices=["lru_block", "lru_global", "lru_block_global"],
+            default=ServerArgs.vortex_alloc_kernel,
+            help="Allocation kernel for CPU VTX staging buffer: lru_block, lru_global, or lru_block_global (default)",
+        )
+
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
@@ -82,6 +83,16 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         self.sparse_attention = sparse_attention
         self.ctx = vortex_torch.cache.Context()
 
+        self.alloc_kernel = model_runner.server_args.vortex_alloc_kernel
+        self.profile_enabled = model_runner.server_args.vortex_profile
+        if self.profile_enabled:
+            self.profile_tokens_generated = 0
+            self.profile_path = os.environ.get("VORTEX_PROFILE_PATH", "profile_data.jsonl")
+            os.makedirs(os.path.dirname(self.profile_path) if os.path.dirname(self.profile_path) else ".", exist_ok=True)
+            self._profile_file = open(self.profile_path, "w")
+            import atexit
+            atexit.register(self._close_profile_file)
+
         self._create_buffers()
         self._initialize_graph(model_runner)
         self.layer_transfer_counter = None
@@ -115,6 +126,12 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         self.num_pages_cpu = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
         self.num_pages_gpu_staging = ((self.gpu_size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
         self.num_pages_gpu_full = ((self.gpu_full_size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
+
+        # Round down staging capacity to a multiple of 1024 (= ASSOCIATIVITY(32) * SETS_PER_BLOCK(32))
+        # so that set-associative kernels have clean divisibility.
+        # This also ensures K/V staging buffers and management structures use the same size.
+        ALIGNMENT = 1024
+        self.num_pages_gpu_staging = (self.num_pages_gpu_staging // ALIGNMENT) * ALIGNMENT
 
         # For compatibility with vortex context (used for landmarks)
         self.num_pages = self.num_pages_cpu
@@ -191,48 +208,49 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         self._create_hybrid_structures_sparse()
 
     def _create_hybrid_structures_sparse(self):
-        """Create hybrid cache management structures for CPU sparse attention layers only."""
+        """Create cache management structures for CPU sparse attention layers."""
         max_page_id = self.num_pages_cpu
         staging_buffer_capacity = self.num_pages_gpu_staging
 
         self.cpu_to_gpu_slot_maps = []
         self.gpu_to_cpu_page_maps = []
 
-        # Hybrid-style data structures (per CPU sparse layer)
-        WAYS = 32
-        num_sets = staging_buffer_capacity // WAYS
-        self.num_sets = num_sets
-        self.slot_stamps = []
-        self.set_clocks = []
-        self.set_versions = []
-        self.set_used_masks = []
+        if self.alloc_kernel in ("lru_block", "lru_global"):
+            self.slot_ages = []
+            self.slots_used_bitmaps = []
+            self.needs_eviction_bitmaps = []
+        elif self.alloc_kernel == "lru_block_global":
+            self.slot_ages = []
+            self.set_used_masks = []
+
+        ASSOCIATIVITY = 32
+        num_sets = staging_buffer_capacity // ASSOCIATIVITY
 
         for _ in range(self.num_cpu_sparse_layers):
-            cpu_to_gpu_map = torch.full(
-                (max_page_id,), -1, dtype=torch.int32, device=self.device
-            ).contiguous()
-            self.cpu_to_gpu_slot_maps.append(cpu_to_gpu_map)
-
-            gpu_to_cpu_map = torch.full(
-                (staging_buffer_capacity,), -1, dtype=torch.int32, device=self.device
-            ).contiguous()
-            self.gpu_to_cpu_page_maps.append(gpu_to_cpu_map)
-
-            # Hybrid data structures: timestamps + per-set clocks + seqlocks + used masks
-            slot_stamps = torch.zeros(staging_buffer_capacity, dtype=torch.int32, device=self.device).contiguous()
-            set_clock = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
-            set_version = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
-            set_used_mask = torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
-
-            # Initialize hybrid structures via kernel (sets clock=1, version=0)
-            vortex_torch.cache.init_hybrid_structures(
-                slot_stamps, set_clock, set_version, staging_buffer_capacity, num_sets
+            self.cpu_to_gpu_slot_maps.append(
+                torch.full((max_page_id,), -1, dtype=torch.int32, device=self.device).contiguous()
+            )
+            self.gpu_to_cpu_page_maps.append(
+                torch.full((staging_buffer_capacity,), -1, dtype=torch.int32, device=self.device).contiguous()
             )
 
-            self.slot_stamps.append(slot_stamps)
-            self.set_clocks.append(set_clock)
-            self.set_versions.append(set_version)
-            self.set_used_masks.append(set_used_mask)
+            if self.alloc_kernel in ("lru_block", "lru_global"):
+                self.slot_ages.append(
+                    torch.zeros(staging_buffer_capacity, dtype=torch.uint8, device=self.device).contiguous()
+                )
+                self.slots_used_bitmaps.append(
+                    torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
+                )
+                self.needs_eviction_bitmaps.append(
+                    torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
+                )
+            elif self.alloc_kernel == "lru_block_global":
+                self.slot_ages.append(
+                    torch.zeros(staging_buffer_capacity, dtype=torch.uint8, device=self.device).contiguous()
+                )
+                self.set_used_masks.append(
+                    torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
+                )
 
         self.max_num_pages = staging_buffer_capacity
         self.temp_owners_bitmap = torch.zeros(self.max_num_pages, dtype=torch.bool, device=self.device).contiguous()
@@ -415,24 +433,71 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         else:
             dst_staging_slots = dst_kv_indices
 
-        # Step 1: Allocation kernel (Hybrid lock-free with seqlock)
-        vortex_torch.cache.allocate_pages_hybrid(
-            sparse_kv_indices=sparse_kv_indices,
-            sparse_kv_indptr=sparse_kv_indptr,
-            cpu_to_gpu_slot_map=cpu_to_gpu_map,
-            gpu_to_cpu_page_map=gpu_to_cpu_map,
-            slot_stamps=self.slot_stamps[local_id],
-            set_clock=self.set_clocks[local_id],
-            set_version=self.set_versions[local_id],
-            set_used_mask=self.set_used_masks[local_id],
-            dst_gpu_slots=dst_staging_slots,
-            owners_bitmap=self.temp_owners_bitmap,
-            evicted_cpu_pages=self.temp_evicted_cpu_pages,
-            overflow_flag=self.temp_overflow_flag,
-            batch_size=batch_size,
-            num_kv_heads=self.head_num,
-            max_num_pages=self.max_num_pages,
-        )
+        # Step 1: Allocation kernel
+        if self.profile_enabled:
+            start_alloc = torch.cuda.Event(enable_timing=True)
+            end_alloc = torch.cuda.Event(enable_timing=True)
+            start_alloc.record()
+
+        if self.alloc_kernel == "lru_block":
+            vortex_torch.cache.allocate_pages_lru_block(
+                sparse_kv_indices=sparse_kv_indices,
+                sparse_kv_indptr=sparse_kv_indptr,
+                cpu_to_gpu_slot_map=cpu_to_gpu_map,
+                gpu_to_cpu_page_map=gpu_to_cpu_map,
+                slot_ages=self.slot_ages[local_id],
+                slots_used_bitmap=self.slots_used_bitmaps[local_id],
+                needs_eviction_bitmap=self.needs_eviction_bitmaps[local_id],
+                dst_gpu_slots=dst_staging_slots,
+                owners_bitmap=self.temp_owners_bitmap,
+                evicted_cpu_pages=self.temp_evicted_cpu_pages,
+                overflow_flag=self.temp_overflow_flag,
+                batch_size=batch_size,
+                num_kv_heads=self.head_num,
+                max_num_pages=self.max_num_pages,
+            )
+        elif self.alloc_kernel == "lru_global":
+            vortex_torch.cache.allocate_pages_lru_global(
+                sparse_kv_indices=sparse_kv_indices,
+                sparse_kv_indptr=sparse_kv_indptr,
+                cpu_to_gpu_slot_map=cpu_to_gpu_map,
+                gpu_to_cpu_page_map=gpu_to_cpu_map,
+                slot_ages=self.slot_ages[local_id],
+                slots_used_bitmap=self.slots_used_bitmaps[local_id],
+                needs_eviction_bitmap=self.needs_eviction_bitmaps[local_id],
+                dst_gpu_slots=dst_staging_slots,
+                owners_bitmap=self.temp_owners_bitmap,
+                evicted_cpu_pages=self.temp_evicted_cpu_pages,
+                overflow_flag=self.temp_overflow_flag,
+                batch_size=batch_size,
+                num_kv_heads=self.head_num,
+                max_num_pages=self.max_num_pages,
+            )
+        elif self.alloc_kernel == "lru_block_global":
+            vortex_torch.cache.allocate_pages_lru_block_global(
+                sparse_kv_indices=sparse_kv_indices,
+                sparse_kv_indptr=sparse_kv_indptr,
+                cpu_to_gpu_slot_map=cpu_to_gpu_map,
+                gpu_to_cpu_page_map=gpu_to_cpu_map,
+                slot_ages=self.slot_ages[local_id],
+                set_used_mask=self.set_used_masks[local_id],
+                dst_gpu_slots=dst_staging_slots,
+                owners_bitmap=self.temp_owners_bitmap,
+                evicted_cpu_pages=self.temp_evicted_cpu_pages,
+                overflow_flag=self.temp_overflow_flag,
+                batch_size=batch_size,
+                num_kv_heads=self.head_num,
+                max_num_pages=self.max_num_pages,
+            )
+
+        if self.profile_enabled:
+            end_alloc.record()
+            num_pages = sparse_kv_indptr[batch_size * self.head_num].item()
+            miss_count = self.temp_owners_bitmap[:num_pages].sum().item()
+            hit_rate = 1.0 - miss_count / num_pages if num_pages > 0 else 0.0
+            start_copy = torch.cuda.Event(enable_timing=True)
+            end_copy = torch.cuda.Event(enable_timing=True)
+            start_copy.record()
 
         # Step 2: Copy kernel
         vortex_torch.cache.copy_kv(
@@ -451,6 +516,24 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             max_num_pages=self.max_num_pages,
         )
 
+        if self.profile_enabled:
+            end_copy.record()
+            torch.cuda.synchronize()
+            alloc_ms = start_alloc.elapsed_time(end_alloc)
+            copy_ms = start_copy.elapsed_time(end_copy)
+            self.profile_tokens_generated += batch_size
+            import json
+            record = {
+                "tokens": self.profile_tokens_generated,
+                "layer_id": layer_id,
+                "alloc_ms": alloc_ms,
+                "copy_ms": copy_ms,
+                "hit_rate": hit_rate,
+                "num_pages": num_pages,
+            }
+            self._profile_file.write(json.dumps(record) + "\n")
+            self._profile_file.flush()
+
         # Check for staging buffer overflow (only when CUDA graph is disabled)
         if self.enable_overflow_check and self.temp_overflow_flag.item() != 0:
             raise RuntimeError(
@@ -461,6 +544,11 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             )
 
         return gpu_k, gpu_v, dst_staging_slots
+
+    def _close_profile_file(self):
+        """Close profile file on process exit."""
+        if hasattr(self, '_profile_file') and self._profile_file and not self._profile_file.closed:
+            self._profile_file.close()
 
     def set_kv_buffer(
         self,

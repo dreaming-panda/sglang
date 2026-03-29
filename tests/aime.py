@@ -52,6 +52,8 @@ def main():
     parser.add_argument("--mem-fraction-static", type=float, default=0.8, help="Static memory fraction")
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum number of new tokens to generate")
     parser.add_argument("--disable-cuda-graph", action="store_true", default=False, help="Disable CUDA graph (default: enabled)")
+    parser.add_argument("--alloc-kernel", type=str, choices=["lru_block", "lru_global", "lru_block_global"], default="lru_block_global", help="Allocation kernel for CPU VTX staging buffer")
+    parser.add_argument("--profile", action="store_true", default=False, help="Enable vortex profiling (disables CUDA graph)")
     args = parser.parse_args()
 
     model_name = args.model_name
@@ -59,11 +61,23 @@ def main():
     mem_fraction_static = args.mem_fraction_static
     max_new_tokens = args.max_new_tokens
     disable_cuda_graph = args.disable_cuda_graph
+    alloc_kernel = args.alloc_kernel
+    profile = args.profile
     enable_vortex_sparsity = True
 
     output_dir = f"DATA/{model_name}/AIME24/gpu_{mem_fraction_static}/max_tokens_{max_new_tokens}"
+    # Add kernel subfolder for cpu_vtx_flashinfer backend
+    if name == "cpu_vtx_flashinfer":
+        output_dir = os.path.join(output_dir, alloc_kernel)
     os.makedirs(output_dir, exist_ok=True)
-    print(f"Arguments: model={model_name}, backend={name}, mem_fraction={mem_fraction_static}, max_tokens={max_new_tokens}")
+
+    # Set profile output path via env var so the memory pool can auto-flush
+    if profile:
+        profile_path = os.path.join(output_dir, "profile_data.jsonl")
+        os.environ["VORTEX_PROFILE_PATH"] = profile_path
+        print(f"Profiling enabled, output: {profile_path}")
+
+    print(f"Arguments: model={model_name}, backend={name}, mem_fraction={mem_fraction_static}, max_tokens={max_new_tokens}, alloc_kernel={alloc_kernel}, profile={profile}")
 
     if name not in ["cpu_vtx_flashinfer", "flashinfer"]:
         enable_vortex_sparsity = False
@@ -74,10 +88,6 @@ def main():
     llm = None
     try:
         print(f"Initializing SGLang Engine...")
-        # Create crash dump folder
-        crash_dump_folder = f"{output_dir}/crash_dumps"
-        os.makedirs(crash_dump_folder, exist_ok=True)
-
         llm = sgl.Engine(model_path=model_name,
                         disable_cuda_graph=disable_cuda_graph,
                         page_size=16,
@@ -91,12 +101,13 @@ def main():
                         vortex_page_reserved_eos=1,
                         vortex_layers_skip=list(range(1)),
                         enable_cpu_vtx_cache=True,
+                        vortex_alloc_kernel=alloc_kernel,
+                        vortex_profile=profile,
                         vortex_module_name="block_sparse_attention",
                         vortex_max_seq_lens=-1,
-                        vortex_cpu_percentage=0.8,
+                        vortex_cpu_percentage=1,
                         tp_size=1,
-                        log_level="debug",
-                        crash_dump_folder=crash_dump_folder
+                        # log_level="debug",
                         )
         print("Engine initialized successfully!")
 
