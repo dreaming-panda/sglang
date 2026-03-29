@@ -38,7 +38,6 @@ if is_flashinfer_available():
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
-    from flashinfer.cascade import merge_state
 
 @dataclass
 class DecodeMetadata:
@@ -189,13 +188,16 @@ class VTXGraphAttnBackend(AttentionBackend):
             + model_runner.server_args.vortex_page_reserved_eos
         )
         max_sparse_tokens = max_bs * topk_budget * self.page_size
+        # Combined buffer holds prefix pages + new tokens for single-wrapper extend
+        max_new_tokens_extend = getattr(model_runner, 'max_total_num_tokens', max_sparse_tokens)
+        max_combined_tokens = max_sparse_tokens + max_new_tokens_extend
         self.sparse_prefill_k_buf = torch.empty(
-            (max_sparse_tokens, self.num_kv_heads, self.head_dim),
+            (max_combined_tokens, self.num_kv_heads, self.head_dim),
             dtype=torch.bfloat16,
             device=model_runner.device,
         )
         self.sparse_prefill_v_buf = torch.empty(
-            (max_sparse_tokens, self.num_kv_heads, self.head_dim),
+            (max_combined_tokens, self.num_kv_heads, self.head_dim),
             dtype=torch.bfloat16,
             device=model_runner.device,
         )
@@ -204,18 +206,22 @@ class VTXGraphAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=model_runner.device,
         )
+        # Pre-allocated combined KV indptr buffers for single-wrapper extend
+        self.combined_kv_indptr_sparse = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=model_runner.device,
+        )
+        self.combined_kv_indptr_dense = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=model_runner.device,
+        )
 
         # ===========================
-        # Prefill wrappers (ragged only)
+        # Prefill wrapper (ragged only)
         # ===========================
 
         fmha_backend = "auto"
         if is_sm100_supported():
             fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
-        self.prefill_wrapper_ragged_sparse = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
 
@@ -294,7 +300,15 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.ctx.profile()  # enter 'profile' mode during warm-up
 
         # ---- Minimal warm-up tensors (placeholders only) ----
+        # Q, O, and custom caches (centroids etc.) are always bf16.
+        # K/V cache dtype must match the actual storage format.
         dtype = torch.bfloat16
+        if self.is_int8:
+            kv_store_dtype = torch.int8
+        elif self.is_fp8:
+            kv_store_dtype = torch.uint8
+        else:
+            kv_store_dtype = torch.bfloat16
 
         try:
             with torch.no_grad():
@@ -302,17 +316,17 @@ class VTXGraphAttnBackend(AttentionBackend):
                 q_dummy = as_vtensor(torch.empty((1, self.group_size, self.head_dim), device=device, dtype=dtype), FORMAT.BATCHED)
                 o_dummy = as_vtensor(torch.empty((0, 1, 1), device=device, dtype=dtype), FORMAT.RAGGED)
                 cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
-                
+
                 cache_dummy = {
                         cache_name:  as_vtensor(torch.zeros(
                                 (0, cache_shape[0], cache_shape[1]),
-                                dtype=dtype,
+                                dtype=kv_store_dtype if cache_name in ("k", "v") else dtype,
                                 device=device,
                             ), FORMAT.PAGED)
-                        
+
                         for (cache_name, cache_shape) in cache_meta_info.items()
                     }
-                
+
                 indexer(q_dummy, o_dummy, cache_dummy, ctx=self.ctx)
 
 
@@ -377,27 +391,54 @@ class VTXGraphAttnBackend(AttentionBackend):
             bs = len(forward_batch.req_pool_indices)
             input_seq_lens = forward_batch.seq_lens.to(torch.int32) - prefix_lens
 
-            # Compute qo_indptr for ragged self-attention (cumsum of input_seq_lens)
+            # Compute qo_indptr for ragged layout (cumsum of input_seq_lens)
             self.qo_indptr[0] = 0
             torch.cumsum(input_seq_lens, dim=0, out=self.qo_indptr[1:bs+1])
 
-            # Plan ragged wrapper for causal self-attention on new tokens
-            self.prefill_wrapper_ragged.plan(
-                self.qo_indptr[:bs+1],
-                self.qo_indptr[:bs+1],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                q_data_type=self.q_data_type,
-            )
-
-            # If cached prefix exists, prepare decode-style indices for the indexer
-            if not extend_no_prefix:
+            if extend_no_prefix:
+                # No cached prefix: plan wrapper for self-attention only
+                self.prefill_wrapper_ragged.plan(
+                    self.qo_indptr[:bs+1],
+                    self.qo_indptr[:bs+1],
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    q_data_type=self.q_data_type,
+                )
+            else:
+                # Has cached prefix: prepare decode-style indices for the indexer
                 vortex_torch.indexer.utils_sglang.plan_decode(
                     cached_seq_lens=prefix_lens,
                     req_to_token=self.req_to_token,
                     req_indices=forward_batch.req_pool_indices,
                     ctx=self.ctx
+                )
+
+                # Pre-compute combined KV indptrs (prefix_tokens + new_tokens)
+                # All KV heads of a request share the same page count; use head 0.
+                H = self.num_kv_heads
+                num_batch_kv = bs * H
+
+                dense_pages_per_req = (
+                    self.ctx.dense_kv_indptr[1::H][:bs]
+                    - self.ctx.dense_kv_indptr[::H][:bs]
+                )
+                dense_prefix_tokens = (dense_pages_per_req * self.page_size).to(torch.int32)
+                self.combined_kv_indptr_dense[0] = 0
+                torch.cumsum(
+                    dense_prefix_tokens + input_seq_lens, dim=0,
+                    out=self.combined_kv_indptr_dense[1:bs + 1]
+                )
+
+                sparse_pages_per_req = (
+                    self.ctx.sparse_kv_indptr[1::H][:bs]
+                    - self.ctx.sparse_kv_indptr[::H][:bs]
+                )
+                sparse_prefix_tokens = (sparse_pages_per_req * self.page_size).to(torch.int32)
+                self.combined_kv_indptr_sparse[0] = 0
+                torch.cumsum(
+                    sparse_prefix_tokens + input_seq_lens, dim=0,
+                    out=self.combined_kv_indptr_sparse[1:bs + 1]
                 )
 
             self.forward_metadata = PrefillMetadata(extend_no_prefix)
@@ -588,17 +629,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 logits_soft_cap=logits_soft_cap,
             )
         else:
-            # Has cached prefix: self-attn on new tokens + sparse cross-attn against prefix
-
-            # Stage 1: Self-attention on new tokens (causal)
-            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                q_view, k_view, v_view,
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
-
-            # Stage 2: Sparse cross-attention against cached prefix (ragged)
+            # Has cached prefix: gather prefix pages + cat new tokens, single causal wrapper
             bs = len(forward_batch.req_pool_indices)
             use_sparsity = (layer.layer_id not in self.layers_skip)
             cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
@@ -613,34 +644,39 @@ class VTXGraphAttnBackend(AttentionBackend):
                     cache=cache,
                     ctx=self.ctx
                 )
-                # Gather selected pages into ragged KV buffer
-                total_tokens = self._gather_pages_to_ragged(cache, bs, sparse=True)
+                kv_indptr = self.ctx.sparse_kv_indptr
+                kv_indices = self.ctx.sparse_kv_indices
+                combined_kv_indptr = self.combined_kv_indptr_sparse
             else:
-                # Dense: gather ALL prefix pages
-                total_tokens = self._gather_pages_to_ragged(cache, bs, sparse=False)
+                kv_indptr = self.ctx.dense_kv_indptr
+                kv_indices = self.ctx.dense_kv_indices
+                combined_kv_indptr = self.combined_kv_indptr_dense
 
-            # Plan sparse ragged wrapper for cross-attention
-            self.prefill_wrapper_ragged_sparse.plan(
+            # Gather prefix pages + cat new tokens into combined ragged buffer
+            total_tokens = self._gather_prefix_and_cat_new(
+                cache, kv_indptr, kv_indices, k_view, v_view, bs
+            )
+
+            # Plan single wrapper with combined kv_indptr (prefix + new)
+            self.prefill_wrapper_ragged.plan(
                 self.qo_indptr[:bs+1],
-                self.sparse_prefill_kv_indptr[:bs+1],
+                combined_kv_indptr[:bs+1],
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
 
-            # Cross-attention (non-causal: all prefix tokens precede new tokens)
-            o2, s2 = self.prefill_wrapper_ragged_sparse.forward_return_lse(
+            # Single causal forward: lower-right aligned mask gives
+            # full attention to prefix + causal within new tokens
+            o = self.prefill_wrapper_ragged.forward(
                 q_view,
                 self.sparse_prefill_k_buf[:total_tokens],
                 self.sparse_prefill_v_buf[:total_tokens],
-                causal=False,
+                causal=True,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
-
-            # Stage 3: Merge self-attention and cross-attention
-            o, _ = merge_state(o1, s1, o2, s2)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -682,40 +718,49 @@ class VTXGraphAttnBackend(AttentionBackend):
         summaries = summaries.view(bs, self.num_kv_heads, self.group_size, self.head_dim)
         return summaries.reshape(bs * self.num_kv_heads, self.group_size, self.head_dim).contiguous()
 
-    def _gather_pages_to_ragged(
+    def _gather_prefix_and_cat_new(
         self,
         cache: Dict[str, torch.Tensor],
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
         bs: int,
-        sparse: bool = True,
     ) -> int:
         """
-        Gather paged KV into contiguous ragged buffers for the ragged wrapper.
+        Gather prefix pages from paged cache and concatenate new K/V tokens
+        into a single ragged buffer for combined causal attention.
 
-        Uses sparse_kv_indptr/indices (topK selected) or dense_kv_indptr/indices (all pages)
-        from self.ctx. Writes into self.sparse_prefill_k_buf, sparse_prefill_v_buf,
-        and sparse_prefill_kv_indptr.
+        Pages are stored per-head: kv_indptr groups as [req0_h0, req0_h1, ..., req1_h0, ...].
+        This method reorganizes per-head pages into multi-head ragged layout
+        [total_tokens, num_kv_heads, head_dim] using vectorized reshape+permute
+        (no inner per-head loop), then appends new tokens after each request's prefix.
 
         Args:
             cache: layer cache dict with "k", "v" (and "k_scale", "v_scale" for int8)
+            kv_indptr: CSR indptr for page groups [bs * num_kv_heads + 1]
+            kv_indices: page IDs for each group
+            k_new: new K tokens [total_new, num_kv_heads, head_dim]
+            v_new: new V tokens [total_new, num_kv_heads, head_dim]
             bs: batch size
-            sparse: if True use sparse indices (topK), else use dense indices (all)
 
         Returns:
             total number of KV tokens written to the ragged buffer
         """
-        if sparse:
-            kv_indptr = self.ctx.sparse_kv_indptr
-            kv_indices = self.ctx.sparse_kv_indices
-        else:
-            kv_indptr = self.ctx.dense_kv_indptr
-            kv_indices = self.ctx.dense_kv_indices
-
-        num_batch_kv = bs * self.num_kv_heads
+        H = self.num_kv_heads
+        D = self.head_dim
+        PS = self.page_size
+        num_batch_kv = bs * H
         total_pages = int(kv_indptr[num_batch_kv].item())
+        qo_indptr = self.qo_indptr
 
         if total_pages == 0:
-            self.sparse_prefill_kv_indptr[:bs + 1] = 0
-            return 0
+            # No prefix pages, just copy new tokens
+            total_new = int(qo_indptr[bs].item())
+            if total_new > 0:
+                self.sparse_prefill_k_buf[:total_new] = k_new[:total_new]
+                self.sparse_prefill_v_buf[:total_new] = v_new[:total_new]
+            return total_new
 
         selected_page_ids = kv_indices[:total_pages]
 
@@ -729,7 +774,6 @@ class VTXGraphAttnBackend(AttentionBackend):
                 cache["v"], cache["v_scale"],
                 selected_page_ids, self.page_size, self.head_dim,
             )
-            # gathered shape: [total_pages, page_size, head_dim]
         elif self.is_fp8:
             gathered_k = cache["k"][selected_page_ids].view(self.data_type).to(torch.bfloat16)
             gathered_v = cache["v"][selected_page_ids].view(self.data_type).to(torch.bfloat16)
@@ -737,34 +781,41 @@ class VTXGraphAttnBackend(AttentionBackend):
             gathered_k = cache["k"][selected_page_ids]  # [total_pages, page_size, head_dim]
             gathered_v = cache["v"][selected_page_ids]
 
-        # Flatten pages to tokens: [total_pages * page_size, head_dim]
-        flat_k = gathered_k.reshape(-1, self.head_dim)
-        flat_v = gathered_v.reshape(-1, self.head_dim)
-
-        # Reassemble per-head pages into multi-head ragged layout:
-        # Pages are stored per-head (page_p_head_h = p * num_kv_heads + h).
-        # kv_indptr groups pages as [req0_head0, req0_head1, ..., req1_head0, ...].
-        # Ragged wrapper expects [total_tokens, num_kv_heads, head_dim] with
-        # kv_indptr [bs+1] giving per-request token counts.
+        # Reassemble per-head pages into multi-head ragged layout + cat new tokens.
+        # Per request: [H*P, PS, D] → reshape [H, P, PS, D] → permute [P, PS, H, D]
+        # → reshape [T, H, D], then append new tokens.
         offset = 0
-        self.sparse_prefill_kv_indptr[0] = 0
         for i in range(bs):
-            # All heads of request i have the same page count
-            head0_start = int(kv_indptr[i * self.num_kv_heads].item())
-            head0_end = int(kv_indptr[i * self.num_kv_heads + 1].item())
-            pages_per_head = head0_end - head0_start
-            tokens_per_request = pages_per_head * self.page_size
+            h0_start = int(kv_indptr[i * H].item())
+            h0_end = int(kv_indptr[i * H + 1].item())
+            P = h0_end - h0_start  # pages per head for this request
+            T = P * PS  # prefix tokens per head
 
-            for h in range(self.num_kv_heads):
-                h_start = int(kv_indptr[i * self.num_kv_heads + h].item())
-                h_end = int(kv_indptr[i * self.num_kv_heads + h + 1].item())
-                src_start = h_start * self.page_size
-                src_end = h_end * self.page_size
-                self.sparse_prefill_k_buf[offset:offset + tokens_per_request, h, :] = flat_k[src_start:src_end]
-                self.sparse_prefill_v_buf[offset:offset + tokens_per_request, h, :] = flat_v[src_start:src_end]
+            if T > 0:
+                req_end = int(kv_indptr[(i + 1) * H].item())
+                # Vectorized: [H*P, PS, D] → [H, P, PS, D] → [P, PS, H, D] → [T, H, D]
+                self.sparse_prefill_k_buf[offset:offset + T] = (
+                    gathered_k[h0_start:req_end]
+                    .view(H, P, PS, D)
+                    .permute(1, 2, 0, 3)
+                    .reshape(T, H, D)
+                )
+                self.sparse_prefill_v_buf[offset:offset + T] = (
+                    gathered_v[h0_start:req_end]
+                    .view(H, P, PS, D)
+                    .permute(1, 2, 0, 3)
+                    .reshape(T, H, D)
+                )
 
-            offset += tokens_per_request
-            self.sparse_prefill_kv_indptr[i + 1] = offset
+            # Cat new tokens for this request
+            q_start = int(qo_indptr[i].item())
+            q_end = int(qo_indptr[i + 1].item())
+            new_len = q_end - q_start
+            if new_len > 0:
+                self.sparse_prefill_k_buf[offset + T:offset + T + new_len] = k_new[q_start:q_end]
+                self.sparse_prefill_v_buf[offset + T:offset + T + new_len] = v_new[q_start:q_end]
+
+            offset += T + new_len
 
         return offset
 

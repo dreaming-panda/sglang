@@ -107,6 +107,15 @@ class VTXGraphCachePool(KVCache):
         self.mem_usage = cache_size / GB
     
     def _initialize_graph(self, model_runner) -> None:
+        # Match cache dummy dtypes to actual storage:
+        # - int8 path: forward_cache sees bf16 K (via shadow buffer), so bf16 for all.
+        # - fp8 path: forward_cache sees uint8 K/V directly.
+        # - bf16 path: everything bf16.
+        # Custom caches (centroids, max, min) are always bf16.
+        if self.is_fp8:
+            kv_store_dtype = torch.uint8
+        else:
+            kv_store_dtype = torch.bfloat16
 
         self.ctx.create(self, model_runner)
         self.ctx.profile()
@@ -114,11 +123,10 @@ class VTXGraphCachePool(KVCache):
         try:
             with torch.no_grad():
                 loc_dummy = torch.empty((0,), dtype=torch.int64, device=self.device)
-                # forward_cache always operates on bf16 (custom caches like centroids)
                 cache_dummy = {
                         cache_name:  as_vtensor(torch.zeros(
                                 (0, cache_shape[0], cache_shape[1]),
-                                dtype=torch.bfloat16,
+                                dtype=kv_store_dtype if cache_name in ("k", "v") else torch.bfloat16,
                                 device=self.device,
                             ), FORMAT.PAGED)
 
