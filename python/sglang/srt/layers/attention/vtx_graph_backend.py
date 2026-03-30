@@ -13,8 +13,7 @@ from typing import TYPE_CHECKING, List, Optional, Union, Dict, Tuple
 import torch
 import vortex_torch
 from vortex_torch.abs import as_vtensor, FORMAT
-from vortex_torch.cache.triton_kernels.paged_decode_int8 import paged_decode_int8
-from vortex_torch.cache.triton_kernels.paged_prefill_int8 import dequant_paged_int8_to_bf16
+from vortex_torch.cache.triton_kernels import paged_decode, dequant_pages_to_bf16
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
@@ -228,7 +227,7 @@ class VTXGraphAttnBackend(AttentionBackend):
         if self.is_int8:
             # Int8 path: no FlashInfer decode wrappers; use custom Triton kernels
             self.decode_wrappers = None
-            self.max_kv_splits_decode = 8
+            self.max_kv_splits_decode = 4
             max_batch_kv_heads = max_bs * self.num_kv_heads
             # Pre-allocate num_kv_splits buffer (set to max for simplicity)
             self.num_kv_splits_decode_buf = torch.full(
@@ -662,8 +661,15 @@ class VTXGraphAttnBackend(AttentionBackend):
                     combined_kv_indptr = self.combined_kv_indptr_dense
 
                 # Gather prefix pages + cat new tokens into combined ragged buffer
+                # Extract FP8 scales for dequantization (no-op 1.0 for non-FP8)
+                k_scale_val = 1.0
+                v_scale_val = 1.0
+                if self.is_fp8:
+                    k_scale_val = layer.k_scale if isinstance(layer.k_scale, (int, float)) else (layer.k_scale.item() if layer.k_scale is not None else 1.0)
+                    v_scale_val = layer.v_scale if isinstance(layer.v_scale, (int, float)) else (layer.v_scale.item() if layer.v_scale is not None else 1.0)
                 total_tokens = self._gather_prefix_and_cat_new(
-                    cache, kv_indptr, kv_indices, k_view, v_view, bs
+                    cache, kv_indptr, kv_indices, k_view, v_view, bs,
+                    k_scale=k_scale_val, v_scale=v_scale_val,
                 )
 
                 # Plan single wrapper with combined kv_indptr (prefix + new)
@@ -733,6 +739,8 @@ class VTXGraphAttnBackend(AttentionBackend):
         k_new: torch.Tensor,
         v_new: torch.Tensor,
         bs: int,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
     ) -> int:
         """
         Gather prefix pages from paged cache and concatenate new K/V tokens
@@ -750,6 +758,8 @@ class VTXGraphAttnBackend(AttentionBackend):
             k_new: new K tokens [total_new, num_kv_heads, head_dim]
             v_new: new V tokens [total_new, num_kv_heads, head_dim]
             bs: batch size
+            k_scale: FP8 K dequantization scale (default 1.0, no-op for non-FP8)
+            v_scale: FP8 V dequantization scale (default 1.0, no-op for non-FP8)
 
         Returns:
             total number of KV tokens written to the ragged buffer
@@ -773,17 +783,19 @@ class VTXGraphAttnBackend(AttentionBackend):
 
         # Gather pages from paged cache, handling dtype
         if self.is_int8:
-            gathered_k = dequant_paged_int8_to_bf16(
+            gathered_k = dequant_pages_to_bf16(
                 cache["k"], cache["k_scale"],
                 selected_page_ids, self.page_size, self.head_dim,
+                quant_type=1,
             )
-            gathered_v = dequant_paged_int8_to_bf16(
+            gathered_v = dequant_pages_to_bf16(
                 cache["v"], cache["v_scale"],
                 selected_page_ids, self.page_size, self.head_dim,
+                quant_type=1,
             )
         elif self.is_fp8:
-            gathered_k = cache["k"][selected_page_ids].view(self.data_type).to(torch.bfloat16)
-            gathered_v = cache["v"][selected_page_ids].view(self.data_type).to(torch.bfloat16)
+            gathered_k = cache["k"][selected_page_ids].view(self.data_type).to(torch.bfloat16) * k_scale
+            gathered_v = cache["v"][selected_page_ids].view(self.data_type).to(torch.bfloat16) * v_scale
         else:
             gathered_k = cache["k"][selected_page_ids]  # [total_pages, page_size, head_dim]
             gathered_v = cache["v"][selected_page_ids]
@@ -1127,12 +1139,10 @@ class VTXGraphAttnBackend(AttentionBackend):
         o = torch.empty_like(q)
 
         num_batch_kv = bs * self.num_kv_heads
-        paged_decode_int8(
+        paged_decode(
             q=q,
             k_buffer=cache_k_int8,
             v_buffer=cache_v_int8,
-            k_scale_buffer=k_scale,
-            v_scale_buffer=v_scale,
             o=o,
             kv_indptr=kv_indptr[:num_batch_kv + 1],
             kv_indices=kv_indices,
@@ -1141,6 +1151,9 @@ class VTXGraphAttnBackend(AttentionBackend):
             max_kv_splits=self.max_kv_splits_decode,
             sm_scale=layer.scaling,
             page_size=self.page_size,
+            quant_type=1,
+            k_scale_buffer=k_scale,
+            v_scale_buffer=v_scale,
             logit_cap=layer.logit_cap if layer.logit_cap is not None else 0.0,
             att_out=self.att_out_buf[:num_batch_kv],
             att_lse=self.att_lse_buf[:num_batch_kv],

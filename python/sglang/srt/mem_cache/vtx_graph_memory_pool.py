@@ -28,7 +28,6 @@ from sglang.srt.utils import (
 
 import vortex_torch
 from vortex_torch.abs import as_vtensor, FORMAT
-from vortex_torch.cache.triton_kernels.paged_prefill_int8 import dequant_paged_int8_to_bf16_inplace
 from vortex_torch.cache.triton_kernels.set_kv import set_kv_buffer_fp8_launcher
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -108,17 +107,24 @@ class VTXGraphCachePool(KVCache):
     
     def _initialize_graph(self, model_runner) -> None:
         # Match cache dummy dtypes to actual storage:
-        # - int8 path: forward_cache sees bf16 K (via shadow buffer), so bf16 for all.
+        # - int8 path: forward_cache sees int8 K directly; reduce kernels dequant inline (QUANT_TYPE==1).
         # - fp8 path: forward_cache sees uint8 K/V directly.
         # - bf16 path: everything bf16.
         # Custom caches (centroids, max, min) are always bf16.
         if self.is_fp8:
             kv_store_dtype = torch.uint8
+        elif self.is_int8:
+            kv_store_dtype = torch.int8
         else:
             kv_store_dtype = torch.bfloat16
 
         self.ctx.create(self, model_runner)
         self.ctx.profile()
+
+        # Set quant context for inline dequantization during profiling
+        if self.is_int8:
+            self.ctx.quant_type = 1
+            self.ctx.kv_scale_ptr = torch.empty((0,), dtype=torch.float16, device=self.device)
 
         try:
             with torch.no_grad():
@@ -185,15 +191,6 @@ class VTXGraphCachePool(KVCache):
                             device=self.device,
                         )
                         self.cache.append(layer_cache)
-                    # Single shared bf16 K working buffer for forward_cache ops
-                    # (centroid/envelope computation needs bf16 K, but set_kv_buffer
-                    # is called one layer at a time so one buffer suffices)
-                    k_shape = self.cache_meta_info["k"]
-                    self._k_bf16_working = torch.zeros(
-                        (self.num_pages, k_shape[0], k_shape[1]),
-                        dtype=torch.bfloat16,
-                        device=self.device,
-                    )
                     # Pre-allocated prefill workspaces: reused each prefill call
                     # to avoid dynamic allocation of large bf16 buffers.
                     # Sized to num_pages (upper bound for any single prefill).
@@ -270,9 +267,6 @@ class VTXGraphCachePool(KVCache):
                 except AttributeError:
                     # Fallback: logical size in bytes
                     total_bytes += int(t.element_size() * t.numel())
-
-        if hasattr(self, '_k_bf16_working'):
-            total_bytes += int(self._k_bf16_working.element_size() * self._k_bf16_working.numel())
 
         return total_bytes
     
@@ -361,37 +355,11 @@ class VTXGraphCachePool(KVCache):
                 loc,
                 self.page_size
             )
-            # Dequantize ENTIRE affected pages from authoritative int8 cache
-            # into _k_bf16_working so forward_cache sees all tokens (not just
-            # the newly written one). This is critical for correct centroid
-            # computation — CMean operates over the full page.
-            token_page_ids = loc // self.page_size  # logical page per token
-            # torch.unique forces CPU-GPU sync (dynamic output shape), which is
-            # forbidden during CUDA graph capture. During decode (the only phase
-            # captured), each sequence processes 1 token so page IDs are already
-            # unique — skip the dedup.
-            if torch.cuda.is_current_stream_capturing():
-                unique_page_ids = token_page_ids
-            else:
-                unique_page_ids = torch.unique(token_page_ids)
-            # Map logical pages to flat page IDs for all KV heads:
-            # flat_page_id = page_id * num_kv_heads + head_id
-            flat_page_ids = (
-                unique_page_ids[:, None] * self.head_num
-                + torch.arange(self.head_num, device=loc.device)[None, :]
-            ).reshape(-1)
-            dequant_paged_int8_to_bf16_inplace(
-                layer_cache["k"],
-                layer_cache["k_scale"],
-                self._k_bf16_working,
-                flat_page_ids.to(torch.int32),
-                self.page_size,
-                self.head_dim,
-            )
-            # Build cache view for forward_cache with bf16 K
-            cache_for_forward = {k: v for k, v in layer_cache.items()}
-            cache_for_forward["k"] = self._k_bf16_working
-            self.sparse_attention.forward_cache(cache_for_forward, loc, ctx=self.ctx)
+            # Pass int8 K directly to forward_cache; reduce kernels dequant
+            # inline using QUANT_TYPE==1 with per-token scales from k_scale.
+            self.ctx.quant_type = 1
+            self.ctx.kv_scale_ptr = layer_cache["k_scale"]
+            self.sparse_attention.forward_cache(layer_cache, loc, ctx=self.ctx)
         elif self.is_fp8:
             # FP8 path: quantize bf16→fp8, bitcast to uint8, scatter into paged cache.
             # Reduce kernels operate directly on uint8 with inline bitcast→fp8→float32 + scale.
@@ -403,8 +371,9 @@ class VTXGraphCachePool(KVCache):
                 loc, self.page_size, k_scale_val, v_scale_val,
                 fp8_type=self.fp8_type,
             )
-            # Propagate fp8_type and per-tensor scale so reduce kernels can dequant inline
+            # Propagate fp8_type, quant_type, and per-tensor scale so reduce kernels can dequant inline
             self.ctx.fp8_type = self.fp8_type
+            self.ctx.quant_type = self.fp8_type + 1  # fp8_type=1 (e4m3) → quant_type=2, fp8_type=2 (e5m2) → quant_type=3
             self.ctx.kv_scale = k_scale_val
             self.sparse_attention.forward_cache(layer_cache, loc, ctx=self.ctx)
         else:
