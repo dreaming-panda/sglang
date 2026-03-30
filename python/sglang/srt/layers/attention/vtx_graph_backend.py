@@ -261,6 +261,9 @@ class VTXGraphAttnBackend(AttentionBackend):
             ]
 
         self.sparse_attention = model_runner.sparse_attention
+        self.algo_name = model_runner.server_args.vortex_module_name
+        self._is_external_algo = self.algo_name in ("nsa", "fsa", "flash_moba")
+
         self.ctx = vortex_torch.indexer.Context()
         self._initialize_graph(model_runner)
         # Other metadata
@@ -634,49 +637,55 @@ class VTXGraphAttnBackend(AttentionBackend):
             use_sparsity = (layer.layer_id not in self.layers_skip)
             cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
 
-            if use_sparsity:
-                # Compute per-request Q summary for page scoring
-                q_summary = self._compute_query_summary(q_view, bs)
-                # Run forward_indexer -> topK page selection
-                self.sparse_attention.forward_indexer(
-                    q=q_summary,
-                    o=self.kv_indices_decode[1],
-                    cache=cache,
-                    ctx=self.ctx
+            if use_sparsity and self._is_external_algo:
+                # External algorithm path: use algorithm's own sparse attention kernel
+                o = self._forward_extend_sparse_external(
+                    q_view, k_view, v_view, cache, bs, layer
                 )
-                kv_indptr = self.ctx.sparse_kv_indptr
-                kv_indices = self.ctx.sparse_kv_indices
-                combined_kv_indptr = self.combined_kv_indptr_sparse
             else:
-                kv_indptr = self.ctx.dense_kv_indptr
-                kv_indices = self.ctx.dense_kv_indices
-                combined_kv_indptr = self.combined_kv_indptr_dense
+                if use_sparsity:
+                    # Compute per-request Q summary for page scoring
+                    q_summary = self._compute_query_summary(q_view, bs)
+                    # Run forward_indexer -> topK page selection
+                    self.sparse_attention.forward_indexer(
+                        q=q_summary,
+                        o=self.kv_indices_decode[1],
+                        cache=cache,
+                        ctx=self.ctx
+                    )
+                    kv_indptr = self.ctx.sparse_kv_indptr
+                    kv_indices = self.ctx.sparse_kv_indices
+                    combined_kv_indptr = self.combined_kv_indptr_sparse
+                else:
+                    kv_indptr = self.ctx.dense_kv_indptr
+                    kv_indices = self.ctx.dense_kv_indices
+                    combined_kv_indptr = self.combined_kv_indptr_dense
 
-            # Gather prefix pages + cat new tokens into combined ragged buffer
-            total_tokens = self._gather_prefix_and_cat_new(
-                cache, kv_indptr, kv_indices, k_view, v_view, bs
-            )
+                # Gather prefix pages + cat new tokens into combined ragged buffer
+                total_tokens = self._gather_prefix_and_cat_new(
+                    cache, kv_indptr, kv_indices, k_view, v_view, bs
+                )
 
-            # Plan single wrapper with combined kv_indptr (prefix + new)
-            self.prefill_wrapper_ragged.plan(
-                self.qo_indptr[:bs+1],
-                combined_kv_indptr[:bs+1],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                q_data_type=self.q_data_type,
-            )
+                # Plan single wrapper with combined kv_indptr (prefix + new)
+                self.prefill_wrapper_ragged.plan(
+                    self.qo_indptr[:bs+1],
+                    combined_kv_indptr[:bs+1],
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    q_data_type=self.q_data_type,
+                )
 
-            # Single causal forward: lower-right aligned mask gives
-            # full attention to prefix + causal within new tokens
-            o = self.prefill_wrapper_ragged.forward(
-                q_view,
-                self.sparse_prefill_k_buf[:total_tokens],
-                self.sparse_prefill_v_buf[:total_tokens],
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
+                # Single causal forward: lower-right aligned mask gives
+                # full attention to prefix + causal within new tokens
+                o = self.prefill_wrapper_ragged.forward(
+                    q_view,
+                    self.sparse_prefill_k_buf[:total_tokens],
+                    self.sparse_prefill_v_buf[:total_tokens],
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -692,14 +701,12 @@ class VTXGraphAttnBackend(AttentionBackend):
             [bs * num_kv_heads, group_size, head_dim] tensor
         """
         qo_indptr = self.qo_indptr[:bs + 1]
-        total_tokens = int(qo_indptr[bs].item())
 
-        # Build segment IDs from qo_indptr for scatter_add
-        seg_ids = torch.zeros(total_tokens, dtype=torch.int64, device=q_view.device)
-        for i in range(bs):
-            start = int(qo_indptr[i].item())
-            end = int(qo_indptr[i + 1].item())
-            seg_ids[start:end] = i
+        # Build segment IDs from qo_indptr for scatter_add (vectorized)
+        counts = (qo_indptr[1:bs + 1] - qo_indptr[:bs]).to(torch.int64)
+        seg_ids = torch.repeat_interleave(
+            torch.arange(bs, device=q_view.device, dtype=torch.int64), counts
+        )
 
         # Scatter-add then divide by count for per-request mean
         summaries = torch.zeros(
@@ -818,6 +825,286 @@ class VTXGraphAttnBackend(AttentionBackend):
             offset += T + new_len
 
         return offset
+
+    def _forward_extend_sparse_external(
+        self,
+        q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        cache: Dict[str, torch.Tensor],
+        bs: int,
+        layer: "RadixAttention",
+    ) -> torch.Tensor:
+        """
+        External algorithm extend path: gather ALL cached pages into contiguous
+        ragged buffer, concatenate new tokens, then dispatch to algorithm-specific
+        sparse attention kernel.
+
+        Args:
+            q: [total_new, num_qo_heads, head_dim]
+            k_new: [total_new, num_kv_heads, head_dim]
+            v_new: [total_new, num_kv_heads, head_dim]
+            cache: layer cache dict with "k", "v"
+            bs: batch size
+            layer: RadixAttention layer
+
+        Returns:
+            [total_new, num_qo_heads, head_dim]
+        """
+        # Step 1: Gather ALL pages + cat new tokens
+        kv_indptr = self.ctx.dense_kv_indptr
+        kv_indices = self.ctx.dense_kv_indices
+
+        # Compute required buffer size: total prefix pages * page_size + total new tokens
+        H = self.num_kv_heads
+        total_pages = int(kv_indptr[bs * H].item())
+        total_new = int(self.qo_indptr[bs].item())
+        required_size = total_pages * self.page_size + total_new
+
+        # Dynamically expand buffer if the pre-allocated one is too small
+        if required_size > self.sparse_prefill_k_buf.shape[0]:
+            device = self.sparse_prefill_k_buf.device
+            self.sparse_prefill_k_buf = torch.empty(
+                (required_size, self.num_kv_heads, self.head_dim),
+                dtype=torch.bfloat16, device=device,
+            )
+            self.sparse_prefill_v_buf = torch.empty(
+                (required_size, self.num_kv_heads, self.head_dim),
+                dtype=torch.bfloat16, device=device,
+            )
+
+        total_kv = self._gather_prefix_and_cat_new(
+            cache, kv_indptr, kv_indices, k_new, v_new, bs
+        )
+
+        k_all = self.sparse_prefill_k_buf[:total_kv]
+        v_all = self.sparse_prefill_v_buf[:total_kv]
+
+        # Step 2: Build cu_seqlens_q (new tokens) and cu_seqlens_k (all tokens)
+        qo_indptr = self.qo_indptr[:bs + 1]
+        cu_seqlens_q = qo_indptr.to(torch.int32)
+
+        # cu_seqlens_k = prefix_tokens + new_tokens per request
+        cu_seqlens_k = self.combined_kv_indptr_dense[:bs + 1].to(torch.int32)
+
+        # Step 3: Dispatch to algorithm-specific kernel
+        if self.algo_name == "nsa":
+            o = self._extend_nsa(q, k_all, v_all, cu_seqlens_q, cu_seqlens_k, layer)
+        elif self.algo_name == "fsa":
+            o = self._extend_fsa(q, k_all, v_all, cu_seqlens_q, cu_seqlens_k, layer)
+        elif self.algo_name == "flash_moba":
+            o = self._extend_flash_moba(q, k_all, v_all, cu_seqlens_q, cu_seqlens_k, layer)
+        else:
+            raise ValueError(f"Unknown external algorithm: {self.algo_name}")
+
+        return o
+
+    def _extend_nsa(
+        self,
+        q: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        layer: "RadixAttention",
+    ) -> torch.Tensor:
+        """
+        NSA (Naive Sparse Attention) extend path.
+
+        compressed_attention's causal mask uses q_idx = position // block_size.
+        If Q only has new tokens (starting from position 0), the mask incorrectly
+        blocks all prefix blocks. Fix: pad Q to match K length so positions are
+        correct, then extract output at new-token positions.
+        """
+        from vortex_torch.kernels.nsa import avgpool_compress, compressed_attention
+        from vortex_torch.attention_backend.nsa import topk_sparse_attention
+
+        kernel_size = 32
+        kernel_stride = 16
+        block_size = 64
+        topk = 16
+
+        bs = cu_seqlens_q.shape[0] - 1
+        total_k = k_all.shape[0]
+        num_q_heads = q.shape[1]
+        max_seqlen_k = int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+
+        # Step 1: Pad Q to match K length (new tokens at end of each request's range)
+        q_padded = torch.zeros(
+            (total_k, num_q_heads, q.shape[2]),
+            dtype=q.dtype, device=q.device,
+        )
+        for i in range(bs):
+            q_start = int(cu_seqlens_q[i].item())
+            q_end = int(cu_seqlens_q[i + 1].item())
+            k_end = int(cu_seqlens_k[i + 1].item())
+            q_len = q_end - q_start
+            if q_len > 0:
+                q_padded[k_end - q_len:k_end] = q[q_start:q_end]
+
+        # Step 2: Compress K for routing
+        k_comp, cu_comp = avgpool_compress(
+            k_all, None, cu_seqlens_k, kernel_size, kernel_stride
+        )
+        v_comp = k_comp
+
+        # Step 3: Compressed attention with padded Q (positions are now correct)
+        max_comp = int((cu_comp[1:] - cu_comp[:-1]).max().item())
+        _, topk_idx = compressed_attention(
+            q_padded, k_comp, v_comp,
+            kernel_size, kernel_stride, block_size, topk,
+            cu_seqlens_k, cu_comp,
+            max_seqlen_k, max_comp,
+            sm_scale=layer.scaling,
+        )
+        # topk_idx shape: [num_kv_heads, total_k, actual_topk]
+        # Prefix positions have topk_idx = -1 (causal mask), kernel skips them
+
+        # Step 4: Sparse attention with single cu_seqlens
+        o_padded = topk_sparse_attention(
+            q_padded, k_all, v_all, topk_idx, block_size,
+            cu_seqlens_k,
+            softmax_scale=layer.scaling,
+        )
+
+        # Step 5: Extract output at new-token positions
+        total_q = int(cu_seqlens_q[bs].item())
+        o = torch.empty(
+            (total_q, num_q_heads, q.shape[2]),
+            dtype=q.dtype, device=q.device,
+        )
+        for i in range(bs):
+            q_start = int(cu_seqlens_q[i].item())
+            q_end = int(cu_seqlens_q[i + 1].item())
+            k_end = int(cu_seqlens_k[i + 1].item())
+            q_len = q_end - q_start
+            if q_len > 0:
+                o[q_start:q_end] = o_padded[k_end - q_len:k_end]
+
+        return o
+
+    def _extend_fsa(
+        self,
+        q: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        layer: "RadixAttention",
+    ) -> torch.Tensor:
+        """
+        FSA (Flash Sparse Attention) extend path.
+
+        The FSA kernel requires Q and K to have the same total_len per sequence.
+        We pad Q to match K's length (zeros at prefix positions), set topk_idx=-1
+        for prefix positions, run FSA with single cu_seqlens, then extract output
+        at new-token positions only.
+        """
+        from vortex_torch.kernels.nsa import avgpool_compress, compressed_attention
+        from vortex_torch.attention_backend.fsa import FSA_topk_sparse_attention
+
+        kernel_size = 32
+        kernel_stride = 16
+        block_size = 64
+        topk = 16
+
+        bs = cu_seqlens_q.shape[0] - 1
+        total_k = k_all.shape[0]
+        num_q_heads = q.shape[1]
+        max_seqlen_k = int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+
+        # Step 1: Pad Q to match K length (new tokens at end of each request's range)
+        # This fixes the causal mask in compressed_attention (same issue as NSA)
+        q_padded = torch.zeros(
+            (total_k, num_q_heads, q.shape[2]),
+            dtype=q.dtype, device=q.device,
+        )
+        for i in range(bs):
+            q_start = int(cu_seqlens_q[i].item())
+            q_end = int(cu_seqlens_q[i + 1].item())
+            k_end = int(cu_seqlens_k[i + 1].item())
+            q_len = q_end - q_start
+            if q_len > 0:
+                q_padded[k_end - q_len:k_end] = q[q_start:q_end]
+
+        # Step 2: Compress K for routing
+        k_comp, cu_comp = avgpool_compress(
+            k_all, None, cu_seqlens_k, kernel_size, kernel_stride
+        )
+        v_comp = k_comp
+
+        # Step 3: Compressed attention with padded Q (positions are now correct)
+        max_comp = int((cu_comp[1:] - cu_comp[:-1]).max().item())
+        _, topk_idx = compressed_attention(
+            q_padded, k_comp, v_comp,
+            kernel_size, kernel_stride, block_size, topk,
+            cu_seqlens_k, cu_comp,
+            max_seqlen_k, max_comp,
+            sm_scale=layer.scaling,
+        )
+        # topk_idx shape: [num_kv_heads, total_k, actual_topk]
+        # Prefix positions have topk_idx = -1 (causal mask), kernel skips them
+
+        # Step 4: Run FSA with single cu_seqlens_k (Q is already padded)
+        o_padded = FSA_topk_sparse_attention(
+            q_padded, k_all, v_all, topk_idx, block_size,
+            cu_seqlens_k,
+            softmax_scale=layer.scaling,
+        )
+
+        # Step 5: Extract output at new-token positions only
+        total_q = int(cu_seqlens_q[bs].item())
+        o = torch.empty(
+            (total_q, num_q_heads, q.shape[2]),
+            dtype=q.dtype, device=q.device,
+        )
+        for i in range(bs):
+            q_start = int(cu_seqlens_q[i].item())
+            q_end = int(cu_seqlens_q[i + 1].item())
+            k_end = int(cu_seqlens_k[i + 1].item())
+            q_len = q_end - q_start
+            if q_len > 0:
+                o[q_start:q_end] = o_padded[k_end - q_len:k_end]
+
+        return o
+
+    def _extend_flash_moba(
+        self,
+        q: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        layer: "RadixAttention",
+    ) -> torch.Tensor:
+        """
+        FlashMoBA extend path:
+        flash_moba_varlen_func natively supports separate cu_seqlens_q/cu_seqlens_k.
+        """
+        try:
+            from vortex_torch.attention_backend.flashmoba import flash_moba_varlen_func
+        except Exception:
+            raise ImportError(
+                "FlashMoBA requires the flash_moba_cuda C++ extension. "
+                "Install it with: cd <flash-moba-repo> && pip install -e ."
+            )
+
+        chunk_size = 64
+        moba_topk = 16
+
+        max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+        max_seqlen_k = int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item())
+
+        o = flash_moba_varlen_func(
+            q, k_all, v_all,
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
+            moba_chunk_size=chunk_size,
+            moba_topk=moba_topk,
+            causal=True,
+        )
+
+        return o
 
     def _forward_decode_int8(
         self,
