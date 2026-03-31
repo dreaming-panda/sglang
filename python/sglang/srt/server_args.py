@@ -195,8 +195,14 @@ class ServerArgs:
     vortex_lb_min_chunk_size: int = 8
     vortex_indexer_dtype: str = "bfloat16"
     vortex_topk_type: str = "naive"
+    vortex_topk_mapping_mode: int = 0
+    vortex_topk_mapping_power: float = 0.5
+    vortex_topk_mapping_lut_path: Optional[str] = None
+    vortex_topk_mapping_quantiles_path: Optional[str] = None
+    vortex_topk_hit_rate: bool = False
     vortex_module_path: str = None
     vortex_module_name: str = None
+    vortex_index_cache_shared_layers: Optional[List[int]] = None
     
     
     # Optimization/debug options

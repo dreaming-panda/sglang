@@ -2182,16 +2182,25 @@ class Scheduler(
 
         success = True
         exec = None
+        result = None
         try:
             func = getattr(self, recv_req.method)
-            func(recv_req.parameters)
+            result = func(recv_req.parameters)
         except Exception as e:
             success = False
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
         barrier()
-        return RpcReqOutput(success, "" if not exec else str(exec))
+        return RpcReqOutput(success, "" if not exec else str(exec), data=result)
+
+    def get_topk_histograms(self, params):
+        from vortex_torch.indexer.output_func import get_calibration_histograms
+        return get_calibration_histograms()
+
+    def clear_topk_histograms(self, params):
+        from vortex_torch.indexer.output_func import clear_calibration_histograms
+        clear_calibration_histograms()
 
     def save_remote_model(self, params):
         url = params["url"]

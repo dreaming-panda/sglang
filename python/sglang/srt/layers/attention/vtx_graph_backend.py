@@ -115,7 +115,12 @@ class VTXGraphAttnBackend(AttentionBackend):
         # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.page_size = model_runner.server_args.page_size
-        self.layers_skip = model_runner.server_args.vortex_layers_skip
+        self.layers_skip = set(model_runner.server_args.vortex_layers_skip or [])
+        self.index_cache_shared_layers = set(
+            model_runner.server_args.vortex_index_cache_shared_layers or []
+        )
+        overlap = self.layers_skip & self.index_cache_shared_layers
+        assert not overlap, f"Layers cannot be both skipped and index-cached: {overlap}"
 
         # ===========================
         # Decode KV-indptr buffers
@@ -634,6 +639,7 @@ class VTXGraphAttnBackend(AttentionBackend):
             # Has cached prefix: gather prefix pages + cat new tokens, single causal wrapper
             bs = len(forward_batch.req_pool_indices)
             use_sparsity = (layer.layer_id not in self.layers_skip)
+            skip_indexer = (layer.layer_id in self.index_cache_shared_layers)
             cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
 
             if use_sparsity and self._is_external_algo:
@@ -643,15 +649,16 @@ class VTXGraphAttnBackend(AttentionBackend):
                 )
             else:
                 if use_sparsity:
-                    # Compute per-request Q summary for page scoring
-                    q_summary = self._compute_query_summary(q_view, bs)
-                    # Run forward_indexer -> topK page selection
-                    self.sparse_attention.forward_indexer(
-                        q=q_summary,
-                        o=self.kv_indices_decode[1],
-                        cache=cache,
-                        ctx=self.ctx
-                    )
+                    if not skip_indexer:
+                        # Compute per-request Q summary for page scoring
+                        q_summary = self._compute_query_summary(q_view, bs)
+                        # Run forward_indexer -> topK page selection
+                        self.sparse_attention.forward_indexer(
+                            q=q_summary,
+                            o=self.kv_indices_decode[1],
+                            cache=cache,
+                            ctx=self.ctx
+                        )
                     kv_indptr = self.ctx.sparse_kv_indptr
                     kv_indices = self.ctx.sparse_kv_indices
                     combined_kv_indptr = self.combined_kv_indptr_sparse
@@ -1194,18 +1201,20 @@ class VTXGraphAttnBackend(AttentionBackend):
 
         # Decide whether to use sparsity on this layer
         use_sparsity = (layer.layer_id not in self.layers_skip)
+        skip_indexer = (layer.layer_id in self.index_cache_shared_layers)
 
         if self.is_int8:
             # ---- Int8 decode path ----
             if use_sparsity:
                 q_grouped = q.view(-1, self.group_size, layer.head_dim).contiguous()
                 # Build sparse indices (indexer writes to kv_indices_decode[1])
-                self.sparse_attention.forward_indexer(
-                    q=q_grouped,
-                    o=self.kv_indices_decode[1],
-                    cache=cache,
-                    ctx=self.ctx
-                )
+                if not skip_indexer:
+                    self.sparse_attention.forward_indexer(
+                        q=q_grouped,
+                        o=self.kv_indices_decode[1],
+                        cache=cache,
+                        ctx=self.ctx
+                    )
                 o = self._forward_decode_int8(
                     q, cache, layer,
                     kv_indptr=self.kv_indptr_decode[1],
@@ -1234,12 +1243,13 @@ class VTXGraphAttnBackend(AttentionBackend):
                 q = q.view(-1, self.group_size, layer.head_dim).contiguous()
 
                 # Build sparse indices into paged KV buffers
-                self.sparse_attention.forward_indexer(
-                    q=q,
-                    o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
-                    cache=cache,
-                    ctx=self.ctx
-                )
+                if not skip_indexer:
+                    self.sparse_attention.forward_indexer(
+                        q=q,
+                        o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
+                        cache=cache,
+                        ctx=self.ctx
+                    )
 
                 # Sparse attention compute
                 o = self.forward_metadata.decode_wrappers[1].forward(

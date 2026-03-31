@@ -1015,6 +1015,7 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+    data: Optional[Any] = None
 
 
 @dataclass
