@@ -200,6 +200,8 @@ class ServerArgs:
     vortex_topk_mapping_lut_path: Optional[str] = None
     vortex_topk_mapping_quantiles_path: Optional[str] = None
     vortex_topk_hit_rate: bool = False
+    vortex_topk_histogram: bool = False
+    vortex_topk_mapping_noscale: bool = False
     vortex_module_path: str = None
     vortex_module_name: str = None
     vortex_index_cache_shared_layers: Optional[List[int]] = None
