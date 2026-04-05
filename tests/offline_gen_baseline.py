@@ -5,8 +5,7 @@ import python.sglang as sgl
 from transformers import AutoTokenizer
 import time
 def main():
-    # model_name = "Qwen/Qwen3-0.6B"
-    model_name = "/checkpoint-fsx/beidchen-sandbox/qwen3_models/Qwen3-32B"
+    model_name = "Qwen/Qwen3-1.7B"
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=False,
                     page_size=16,
@@ -39,7 +38,7 @@ def main():
     ) for text in texts
     ]
     
-    prompts = prompts * 128
+    prompts = prompts * 8
     sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 2048}
 
     total_tokens = 0
