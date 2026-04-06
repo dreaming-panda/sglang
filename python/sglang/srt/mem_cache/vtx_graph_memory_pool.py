@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import logging
+import os
 from typing import List, Optional, Tuple, Union, Dict
 
 import numpy as np
@@ -94,6 +95,22 @@ class VTXGraphCachePool(KVCache):
 
         self._create_buffers()
         self._initialize_graph(model_runner)
+
+        # Profiling support
+        self.profile_enabled = model_runner.server_args.vortex_profile
+        if self.profile_enabled:
+            self.profile_tokens_generated = 0
+            self.profile_log_interval = int(os.environ.get("VORTEX_PROFILE_LOG_INTERVAL", "100"))
+            self.profile_step_count = 0
+            self.profile_attn_accum = 0.0
+            self.profile_nonattn_accum = 0.0
+            self.profile_accum_count = 0
+            self.profile_path = os.environ.get("VORTEX_PROFILE_PATH", "profile_data.jsonl")
+            os.makedirs(os.path.dirname(self.profile_path) if os.path.dirname(self.profile_path) else ".", exist_ok=True)
+            self._profile_file = open(self.profile_path, "w")
+            import atexit
+            atexit.register(lambda: self._profile_file.close() if not self._profile_file.closed else None)
+
         self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None

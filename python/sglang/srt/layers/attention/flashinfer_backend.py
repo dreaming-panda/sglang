@@ -90,6 +90,22 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
 
+        # Profiling support
+        self._profile_enabled = getattr(model_runner.server_args, 'vortex_profile', False)
+        print(f"[FlashInferAttnBackend] _profile_enabled={self._profile_enabled}", flush=True)
+        if self._profile_enabled:
+            import os
+            self._profile_path = os.environ.get("VORTEX_PROFILE_PATH", "profile_data.jsonl")
+            os.makedirs(os.path.dirname(self._profile_path) if os.path.dirname(self._profile_path) else ".", exist_ok=True)
+            self._profile_file = open(self._profile_path, "w")
+            self._profile_tokens = 0
+            self._profile_step = 0
+            self._profile_log_interval = int(os.environ.get("VORTEX_PROFILE_LOG_INTERVAL", "100"))
+            self._profile_attn_accum = 0.0
+            self._profile_count = 0
+            import atexit
+            atexit.register(lambda: self._profile_file.close() if not self._profile_file.closed else None)
+
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -546,6 +562,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        if self._profile_enabled:
+            _ev_start = torch.cuda.Event(enable_timing=True)
+            _ev_end = torch.cuda.Event(enable_timing=True)
+            _ev_start.record()
+
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -555,6 +576,13 @@ class FlashInferAttnBackend(AttentionBackend):
             k_scale=layer.k_scale,
             v_scale=layer.v_scale,
         )
+
+        if self._profile_enabled:
+            _ev_end.record()
+            # NO sync — defer to model_runner
+            if not hasattr(self, '_pending_attn_events'):
+                self._pending_attn_events = []
+            self._pending_attn_events.append((_ev_start, _ev_end))
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

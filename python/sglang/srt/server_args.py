@@ -194,6 +194,7 @@ class ServerArgs:
     vortex_page_reserved_eos: int = 1
     enable_cpu_vtx_cache: bool = False  # Enable LRU cache for CPU VTX staging buffer
     vortex_alloc_kernel: str = "lru_block_global"  # Allocation kernel: "lru_block", "lru_global", or "lru_block_global"
+    vortex_staging_factor: float = 2.0  # Staging cache safety factor (multiplier on working set size)
     vortex_profile: bool = False
     vortex_cg: bool = False
     vortex_max_seq_lens: int = -1
@@ -1773,9 +1774,15 @@ class ServerArgs:
         parser.add_argument(
             "--vortex-alloc-kernel",
             type=str,
-            choices=["lru_block", "lru_global", "lru_block_global"],
+            choices=["lru_block", "lru_global", "lru_block_global", "lfu_block_global", "random_block_global"],
             default=ServerArgs.vortex_alloc_kernel,
-            help="Allocation kernel for CPU VTX staging buffer: lru_block, lru_global, or lru_block_global (default)",
+            help="Allocation kernel for CPU VTX staging buffer: lru_block, lru_global, lru_block_global (default), lfu_block_global, or random_block_global",
+        )
+        parser.add_argument(
+            "--vortex-staging-factor",
+            type=float,
+            default=ServerArgs.vortex_staging_factor,
+            help="Staging cache safety factor (multiplier on working set size, default 2.0)",
         )
 
 

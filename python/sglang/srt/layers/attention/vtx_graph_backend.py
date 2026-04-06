@@ -75,8 +75,12 @@ class VTXGraphAttnBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
+        # Profiling support
+        self._profile_enabled = getattr(model_runner.server_args, 'vortex_profile', False)
+        print(f"[VTXGraphAttnBackend] _profile_enabled={self._profile_enabled}", flush=True)
+
         assert model_runner.sliding_window_size is None
-        assert not model_runner.model_config.is_encoder_decoder 
+        assert not model_runner.model_config.is_encoder_decoder
         assert not self.skip_prefill
         assert not self.is_multimodal
         assert kv_indptr_buf is None
@@ -828,6 +832,7 @@ class VTXGraphAttnBackend(AttentionBackend):
         assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
+        _profile = self._profile_enabled
 
         # Optionally write incoming K/V to decode cache
         if k is not None:
@@ -836,6 +841,11 @@ class VTXGraphAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+
+        if _profile:
+            _ev_start = torch.cuda.Event(enable_timing=True)
+            _ev_end = torch.cuda.Event(enable_timing=True)
+            _ev_start.record()
 
         # Read Cache from memory pool
         cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
@@ -910,6 +920,13 @@ class VTXGraphAttnBackend(AttentionBackend):
                     k_scale=layer.k_scale,
                     v_scale=layer.v_scale,
                 )
+
+        if _profile:
+            _ev_end.record()
+            # NO sync — defer to model_runner
+            if not hasattr(self, '_pending_attn_events'):
+                self._pending_attn_events = []
+            self._pending_attn_events.append((_ev_start, _ev_end))
 
         # Restore to merged head dimension
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

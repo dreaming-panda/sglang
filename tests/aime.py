@@ -52,8 +52,11 @@ def main():
     parser.add_argument("--mem-fraction-static", type=float, default=0.8, help="Static memory fraction")
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum number of new tokens to generate")
     parser.add_argument("--disable-cuda-graph", action="store_true", default=False, help="Disable CUDA graph (default: enabled)")
-    parser.add_argument("--alloc-kernel", type=str, choices=["lru_block", "lru_global", "lru_block_global"], default="lru_block_global", help="Allocation kernel for CPU VTX staging buffer")
+    parser.add_argument("--alloc-kernel", type=str, choices=["lru_block", "lru_global", "lru_block_global", "lfu_block_global", "random_block_global"], default="lru_block_global", help="Allocation kernel for CPU VTX staging buffer")
+    parser.add_argument("--kv-cache-dtype", type=str, choices=["auto", "fp8_e5m2", "fp8_e4m3", "int8"], default="auto", help="KV cache data type")
     parser.add_argument("--profile", action="store_true", default=False, help="Enable vortex profiling (disables CUDA graph)")
+    parser.add_argument("--staging-factor", type=float, default=2.0, help="Staging cache safety factor")
+    parser.add_argument("--topk", type=int, default=30, help="Top-k pages for sparse attention")
     args = parser.parse_args()
 
     model_name = args.model_name
@@ -62,22 +65,29 @@ def main():
     max_new_tokens = args.max_new_tokens
     disable_cuda_graph = args.disable_cuda_graph
     alloc_kernel = args.alloc_kernel
+    kv_cache_dtype = args.kv_cache_dtype
     profile = args.profile
+    staging_factor = args.staging_factor
+    topk_val = args.topk
     enable_vortex_sparsity = True
 
-    output_dir = f"DATA/{model_name}/AIME24/gpu_{mem_fraction_static}/max_tokens_{max_new_tokens}"
+    output_dir = f"results/{model_name}/AIME24/gpu_{mem_fraction_static}/max_tokens_{max_new_tokens}"
     # Add kernel subfolder for cpu_vtx_flashinfer backend
     if name == "cpu_vtx_flashinfer":
         output_dir = os.path.join(output_dir, alloc_kernel)
+    # Add kv-cache-dtype subfolder when not auto
+    if kv_cache_dtype != "auto":
+        output_dir = os.path.join(output_dir, kv_cache_dtype)
     os.makedirs(output_dir, exist_ok=True)
 
     # Set profile output path via env var so the memory pool can auto-flush
     if profile:
-        profile_path = os.path.join(output_dir, "profile_data.jsonl")
+        profile_path = os.environ.get("VORTEX_PROFILE_PATH",
+                                       os.path.join(output_dir, "profile_data.jsonl"))
         os.environ["VORTEX_PROFILE_PATH"] = profile_path
         print(f"Profiling enabled, output: {profile_path}")
 
-    print(f"Arguments: model={model_name}, backend={name}, mem_fraction={mem_fraction_static}, max_tokens={max_new_tokens}, alloc_kernel={alloc_kernel}, profile={profile}")
+    print(f"Arguments: model={model_name}, backend={name}, mem_fraction={mem_fraction_static}, max_tokens={max_new_tokens}, alloc_kernel={alloc_kernel}, kv_cache_dtype={kv_cache_dtype}, profile={profile}")
 
     if name not in ["cpu_vtx_flashinfer", "flashinfer"]:
         enable_vortex_sparsity = False
@@ -93,18 +103,20 @@ def main():
                         page_size=16,
                         mem_fraction_static=mem_fraction_static,
                         cpu_mem_fraction=0.6,
-                        vortex_topk_val=30,
+                        vortex_topk_val=topk_val,
                         disable_overlap_schedule=True,
                         attention_backend=attention_backend,
                         enable_vortex_sparsity=enable_vortex_sparsity,
                         vortex_page_reserved_bos=1,
                         vortex_page_reserved_eos=1,
-                        vortex_layers_skip=list(range(1)),
+                        vortex_layers_skip=[],
                         enable_cpu_vtx_cache=True,
                         vortex_alloc_kernel=alloc_kernel,
+                        vortex_staging_factor=staging_factor,
+                        kv_cache_dtype=kv_cache_dtype,
                         vortex_profile=profile,
                         vortex_module_name="block_sparse_attention",
-                        vortex_max_seq_lens=-1,
+                        vortex_max_seq_lens=max_new_tokens,
                         vortex_cpu_percentage=1,
                         tp_size=1,
                         # log_level="debug",

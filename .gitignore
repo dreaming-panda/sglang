@@ -1,6 +1,9 @@
 benchmark_copy_kernel.py
 plot_results.py
 
+# Thesis
+thesis/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

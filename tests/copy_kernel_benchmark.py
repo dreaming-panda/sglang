@@ -188,6 +188,14 @@ def pretty_gbps(bytes_copied, seconds):
     return (bytes_copied / seconds) / 1e9
 
 def main():
+    import argparse
+    import json as json_mod
+
+    parser = argparse.ArgumentParser(description="Benchmark sparse KV copy kernels")
+    parser.add_argument("--json-output", type=str, default=None,
+                        help="Path to write JSON results (for plot_copy_bandwidth.py)")
+    args = parser.parse_args()
+
     torch.manual_seed(0)
     assert torch.cuda.is_available(), "CUDA required"
 
@@ -217,11 +225,13 @@ def main():
     total_entries = total_pages_per_head * page_size
     cpu_k = torch.randn((total_entries, 1, head_dim), dtype=dtype, pin_memory=True)
     cpu_v = torch.randn_like(cpu_k).pin_memory()
-    
+
     print(cpu_v.is_pinned())
 
     print(f"CPU buffers: {cpu_k.shape}, dtype={dtype}")
     print(f"page_size={page_size}, head_dim={head_dim}")
+
+    json_results = []
 
     for n_sp in test_sparse_pages:
         if n_sp > total_pages_per_head:
@@ -268,6 +278,20 @@ def main():
         print(f"Latency (median over iters): baseline={t_base*1e3:.2f} ms, tiled={t_tiled*1e3:.2f} ms")
         print(f"Effective H2D BW (approx):  baseline={pretty_gbps(bytes_total, t_base):.2f} GB/s, "
               f"tiled={pretty_gbps(bytes_total, t_tiled):.2f} GB/s")
+
+        json_results.append({
+            "num_pages": n_sp,
+            "baseline_ms": t_base * 1e3,
+            "baseline_gbps": pretty_gbps(bytes_total, t_base),
+            "tiled_ms": t_tiled * 1e3,
+            "tiled_gbps": pretty_gbps(bytes_total, t_tiled),
+            "bytes_total": bytes_total,
+        })
+
+    if args.json_output:
+        with open(args.json_output, "w") as f:
+            json_mod.dump(json_results, f, indent=2)
+        print(f"\nJSON results saved to {args.json_output}")
 
 if __name__ == "__main__":
     main()

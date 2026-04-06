@@ -13,6 +13,15 @@ from sglang.srt.utils import is_cuda
 import vortex_torch
 from vortex_torch.abs import as_vtensor, FORMAT
 from vortex_torch.cache.unified_view import UnifiedCacheView
+from vortex_torch.cache.triton_kernels.set_kv import (
+    set_kv_buffer_int8_launcher,
+    set_kv_buffer_fp8_launcher,
+    store_kv_cpu_and_gpu_int8,
+    store_kv_cpu_and_gpu_fp8,
+    store_kv_unified_int8,
+    store_kv_unified_fp8,
+)
+from vortex_torch.cache.triton_kernels.paged_prefill_int8 import dequant_paged_int8_to_bf16_inplace
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -87,11 +96,20 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         self.profile_enabled = model_runner.server_args.vortex_profile
         if self.profile_enabled:
             self.profile_tokens_generated = 0
+            self.profile_log_interval = int(os.environ.get("VORTEX_PROFILE_LOG_INTERVAL", "100"))
+            self.profile_step_count = 0
+            self.profile_attn_accum = 0.0
+            self.profile_nonattn_accum = 0.0
+            self.profile_accum_count = 0
             self.profile_path = os.environ.get("VORTEX_PROFILE_PATH", "profile_data.jsonl")
             os.makedirs(os.path.dirname(self.profile_path) if os.path.dirname(self.profile_path) else ".", exist_ok=True)
             self._profile_file = open(self.profile_path, "w")
             import atexit
             atexit.register(self._close_profile_file)
+
+        self.is_int8 = (self.dtype == torch.int8)
+        self.is_fp8 = (self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2))
+        self.fp8_type = 1 if self.dtype == torch.float8_e4m3fn else (2 if self.dtype == torch.float8_e5m2 else 0)
 
         self._create_buffers()
         self._initialize_graph(model_runner)
@@ -118,9 +136,6 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         # GPU memory usage (staging + full attention buffers)
         self.mem_usage = (staging_size + full_attn_size) / GB
 
-        assert self.dtype == torch.bfloat16
-        assert self.store_dtype == torch.bfloat16
-
     def _create_buffers(self):
         # Page calculations for different buffer types
         self.num_pages_cpu = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
@@ -138,6 +153,14 @@ class CPUVTXGraphTokenToKVPool(KVCache):
 
         self.cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
 
+        # Determine storage dtype for K/V buffers
+        if self.is_int8:
+            kv_store_dtype = torch.int8
+        elif self.is_fp8:
+            kv_store_dtype = torch.uint8
+        else:
+            kv_store_dtype = self.store_dtype  # bf16
+
         # ========================================
         # CPU SPARSE LAYERS: CPU pinned + GPU staging
         # ========================================
@@ -148,7 +171,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
                 if cache_name in ["k", "v"]:
                     temp[cache_name] = torch.zeros(
                         (self.num_pages_cpu, cache_shape[0], cache_shape[1]),
-                        dtype=self.store_dtype,
+                        dtype=kv_store_dtype,
                         device='cpu',
                         pin_memory=True,
                     )
@@ -160,14 +183,42 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             for _ in range(self.num_cpu_sparse_layers):
                 layer_cache = {}
                 for (cache_name, cache_shape) in self.cache_meta_info.items():
-                    # k and v use GPU staging buffer size; other caches (e.g., centroids) use full CPU size
-                    num_pages_for_cache = self.num_pages_gpu_staging if cache_name in ["k", "v"] else self.num_pages_cpu
-                    layer_cache[cache_name] = torch.zeros(
-                        (num_pages_for_cache, cache_shape[0], cache_shape[1]),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
+                    if cache_name in ["k", "v"]:
+                        # K/V use GPU staging buffer size with quantized dtype
+                        layer_cache[cache_name] = torch.zeros(
+                            (self.num_pages_gpu_staging, cache_shape[0], cache_shape[1]),
+                            dtype=kv_store_dtype,
+                            device=self.device,
+                        )
+                    else:
+                        # Custom caches (centroids etc.) always bf16, use full CPU page count
+                        layer_cache[cache_name] = torch.zeros(
+                            (self.num_pages_cpu, cache_shape[0], cache_shape[1]),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
                 self.cache_staging.append(layer_cache)
+
+            # Int8: persistent per-token scale buffers on GPU for ALL cpu sparse pages
+            # Scales are tiny (~3.2 MB/layer) so they always live on GPU.
+            # When int8 pages are copied back from CPU → GPU staging, scales are already available.
+            if self.is_int8:
+                self.cache_scale = []
+                for _ in range(self.num_cpu_sparse_layers):
+                    self.cache_scale.append({
+                        "k_scale": torch.zeros(
+                            (self.num_pages_cpu, self.page_size, 1),
+                            dtype=torch.float16,
+                            device=self.device,
+                        ),
+                        "v_scale": torch.zeros(
+                            (self.num_pages_cpu, self.page_size, 1),
+                            dtype=torch.float16,
+                            device=self.device,
+                        ),
+                    })
+                # No staging-indexed scale buffers needed: the paged_decode_int8 kernel
+                # resolves scale page IDs on-the-fly via gpu_to_cpu_page_maps.
 
             # ========================================
             # GPU SPARSE LAYERS: GPU KV + centroids (like vtx_graph_backend)
@@ -176,10 +227,28 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             for _ in range(self.num_gpu_sparse_layers):
                 layer_cache = {}
                 for (cache_name, cache_shape) in self.cache_meta_info.items():
-                    # All caches use full GPU size (no staging needed)
-                    layer_cache[cache_name] = torch.zeros(
-                        (self.num_pages_gpu_full, cache_shape[0], cache_shape[1]),
-                        dtype=self.store_dtype,
+                    if cache_name in ["k", "v"]:
+                        layer_cache[cache_name] = torch.zeros(
+                            (self.num_pages_gpu_full, cache_shape[0], cache_shape[1]),
+                            dtype=kv_store_dtype,
+                            device=self.device,
+                        )
+                    else:
+                        layer_cache[cache_name] = torch.zeros(
+                            (self.num_pages_gpu_full, cache_shape[0], cache_shape[1]),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
+                # Int8: per-token scale buffers for GPU sparse layers
+                if self.is_int8:
+                    layer_cache["k_scale"] = torch.zeros(
+                        (self.num_pages_gpu_full, self.page_size, 1),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
+                    layer_cache["v_scale"] = torch.zeros(
+                        (self.num_pages_gpu_full, self.page_size, 1),
+                        dtype=torch.float16,
                         device=self.device,
                     )
                 self.cache_gpu_sparse.append(layer_cache)
@@ -190,7 +259,7 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             self.k_buffer_full = [
                 torch.zeros(
                     (self.num_pages_gpu_full, self.page_size, 1, self.head_dim),
-                    dtype=self.store_dtype,
+                    dtype=kv_store_dtype,
                     device=self.device,
                 )
                 for _ in range(self.num_full_layers)
@@ -198,59 +267,80 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             self.v_buffer_full = [
                 torch.zeros(
                     (self.num_pages_gpu_full, self.page_size, 1, self.head_dim),
-                    dtype=self.store_dtype,
+                    dtype=kv_store_dtype,
                     device=self.device,
                 )
                 for _ in range(self.num_full_layers)
             ]
+            # Int8: scale buffers for full attention layers
+            if self.is_int8:
+                self.k_scale_full = [
+                    torch.zeros(
+                        (self.num_pages_gpu_full, self.page_size, 1),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
+                    for _ in range(self.num_full_layers)
+                ]
+                self.v_scale_full = [
+                    torch.zeros(
+                        (self.num_pages_gpu_full, self.page_size, 1),
+                        dtype=torch.float16,
+                        device=self.device,
+                    )
+                    for _ in range(self.num_full_layers)
+                ]
+
+            # Shared bf16 K working buffer for forward_cache (centroid computation needs bf16 K).
+            # Needed for int8 (dequant int8→bf16). fp8 uses UnifiedCacheView with
+            # fp8-aware unified reduce kernel instead.
+            if self.is_int8:
+                k_shape = self.cache_meta_info["k"]
+                max_pages = max(self.num_pages_gpu_staging, self.num_pages_gpu_full)
+                self._k_bf16_working = torch.zeros(
+                    (max_pages, k_shape[0], k_shape[1]),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
 
         # Hybrid cache structures for CPU SPARSE layers only (LRU management)
         self._create_hybrid_structures_sparse()
 
     def _create_hybrid_structures_sparse(self):
         """Create cache management structures for CPU sparse attention layers."""
+        from vortex_torch.cache.staging_cache import StagingCache
+
         max_page_id = self.num_pages_cpu
         staging_buffer_capacity = self.num_pages_gpu_staging
 
-        self.cpu_to_gpu_slot_maps = []
-        self.gpu_to_cpu_page_maps = []
+        # Determine cache policy from alloc_kernel name
+        # Legacy names: "lru_block_global" -> policy "lru"
+        # New names: "lfu_block_global" -> policy "lfu", "random_block_global" -> policy "random"
+        cache_policy = "lru"
+        if self.alloc_kernel.startswith("lfu"):
+            cache_policy = "lfu"
+        elif self.alloc_kernel.startswith("random"):
+            cache_policy = "random"
+        self.cache_policy = cache_policy
 
-        if self.alloc_kernel in ("lru_block", "lru_global"):
-            self.slot_ages = []
-            self.slots_used_bitmaps = []
-            self.needs_eviction_bitmaps = []
-        elif self.alloc_kernel == "lru_block_global":
-            self.slot_ages = []
-            self.set_used_masks = []
-
-        ASSOCIATIVITY = 32
-        num_sets = staging_buffer_capacity // ASSOCIATIVITY
-
+        # Create one StagingCache per CPU sparse layer
+        self.staging_caches = []
         for _ in range(self.num_cpu_sparse_layers):
-            self.cpu_to_gpu_slot_maps.append(
-                torch.full((max_page_id,), -1, dtype=torch.int32, device=self.device).contiguous()
-            )
-            self.gpu_to_cpu_page_maps.append(
-                torch.full((staging_buffer_capacity,), -1, dtype=torch.int32, device=self.device).contiguous()
+            self.staging_caches.append(
+                StagingCache(
+                    policy=cache_policy,
+                    staging_capacity=staging_buffer_capacity,
+                    max_num_pages=max_page_id,
+                    device=self.device,
+                )
             )
 
-            if self.alloc_kernel in ("lru_block", "lru_global"):
-                self.slot_ages.append(
-                    torch.zeros(staging_buffer_capacity, dtype=torch.uint8, device=self.device).contiguous()
-                )
-                self.slots_used_bitmaps.append(
-                    torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
-                )
-                self.needs_eviction_bitmaps.append(
-                    torch.zeros(staging_buffer_capacity, dtype=torch.bool, device=self.device).contiguous()
-                )
-            elif self.alloc_kernel == "lru_block_global":
-                self.slot_ages.append(
-                    torch.zeros(staging_buffer_capacity, dtype=torch.uint8, device=self.device).contiguous()
-                )
-                self.set_used_masks.append(
-                    torch.zeros(num_sets, dtype=torch.int32, device=self.device).contiguous()
-                )
+        # Backward-compatible accessors (used by other parts of the codebase)
+        self.cpu_to_gpu_slot_maps = [sc.cpu_to_gpu_slot_map for sc in self.staging_caches]
+        self.gpu_to_cpu_page_maps = [sc.gpu_to_cpu_page_map for sc in self.staging_caches]
+        self.slot_ages = [sc.slot_state for sc in self.staging_caches]
+        # All kernels now use per-set uint32 bitmask
+        self.set_used_masks = [sc.set_used_masks for sc in self.staging_caches]
 
         self.max_num_pages = staging_buffer_capacity
         self.temp_owners_bitmap = torch.zeros(self.max_num_pages, dtype=torch.bool, device=self.device).contiguous()
@@ -308,6 +398,14 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         for layer_cache in self.cache_staging:
             for tensor in layer_cache.values():
                 total_bytes += np.prod(tensor.shape) * tensor.dtype.itemsize
+        # Persistent scale buffers for int8
+        if self.is_int8 and hasattr(self, 'cache_scale'):
+            for scale_dict in self.cache_scale:
+                for tensor in scale_dict.values():
+                    total_bytes += np.prod(tensor.shape) * tensor.dtype.itemsize
+        # Int8 working buffer for dequant
+        if hasattr(self, '_k_bf16_working'):
+            total_bytes += np.prod(self._k_bf16_working.shape) * self._k_bf16_working.dtype.itemsize
         return total_bytes
 
     def get_full_attention_size_bytes(self) -> int:
@@ -317,6 +415,11 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         for k_buf, v_buf in zip(self.k_buffer_full, self.v_buffer_full):
             total_bytes += np.prod(k_buf.shape) * k_buf.dtype.itemsize
             total_bytes += np.prod(v_buf.shape) * v_buf.dtype.itemsize
+        # Full attention scale buffers for int8
+        if self.is_int8 and hasattr(self, 'k_scale_full'):
+            for ks, vs in zip(self.k_scale_full, self.v_scale_full):
+                total_bytes += np.prod(ks.shape) * ks.dtype.itemsize
+                total_bytes += np.prod(vs.shape) * vs.dtype.itemsize
         # GPU sparse layers
         for layer_cache in self.cache_gpu_sparse:
             for tensor in layer_cache.values():
@@ -410,9 +513,11 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             dst_kv_indices: Optional destination indices buffer
 
         Returns:
-            k_staging: GPU K staging buffer
+            k_staging: GPU K staging buffer (bf16/int8/uint8 depending on dtype)
             v_staging: GPU V staging buffer
             dst_staging_slots: GPU slots where pages were placed
+            k_scale: (int8 only) persistent GPU K scale buffer, None otherwise
+            v_scale: (int8 only) persistent GPU V scale buffer, None otherwise
         """
         local_id, layer_type = self.layers_mapping[layer_id]
         if layer_type != 'cpu_sparse':
@@ -435,46 +540,28 @@ class CPUVTXGraphTokenToKVPool(KVCache):
 
         # Step 1: Allocation kernel
         if self.profile_enabled:
+            # Snapshot hit rate BEFORE allocation modifies the slot map.
+            # All GPU ops — no .item() or sync. We use indptr to index rather than
+            # slicing with a GPU scalar (which would trigger implicit sync).
+            # The indptr value is batch_size * head_num which is a Python int.
+            _indptr_idx = batch_size * self.head_num
+            # Use torch ops to compute hit rate without sync:
+            # sparse_kv_indices has all pages packed; indptr tells us total count.
+            # We check the full array up to indptr and mask with a range comparison.
+            _total_pages = sparse_kv_indptr[_indptr_idx]  # GPU scalar tensor
+            _all_slots = cpu_to_gpu_map[sparse_kv_indices]  # index the full buffer
+            # Build mask: positions < _total_pages are valid requests
+            _positions = torch.arange(sparse_kv_indices.shape[0],
+                                      device=sparse_kv_indices.device)
+            _valid = _positions < _total_pages  # GPU bool tensor, no sync
+            _hits = (_all_slots >= 0) & _valid
+            _hit_rate_tensor = _hits.float().sum() / _valid.float().sum().clamp(min=1)
             start_alloc = torch.cuda.Event(enable_timing=True)
             end_alloc = torch.cuda.Event(enable_timing=True)
             start_alloc.record()
 
         if self.alloc_kernel == "lru_block":
             vortex_torch.cache.allocate_pages_lru_block(
-                sparse_kv_indices=sparse_kv_indices,
-                sparse_kv_indptr=sparse_kv_indptr,
-                cpu_to_gpu_slot_map=cpu_to_gpu_map,
-                gpu_to_cpu_page_map=gpu_to_cpu_map,
-                slot_ages=self.slot_ages[local_id],
-                slots_used_bitmap=self.slots_used_bitmaps[local_id],
-                needs_eviction_bitmap=self.needs_eviction_bitmaps[local_id],
-                dst_gpu_slots=dst_staging_slots,
-                owners_bitmap=self.temp_owners_bitmap,
-                evicted_cpu_pages=self.temp_evicted_cpu_pages,
-                overflow_flag=self.temp_overflow_flag,
-                batch_size=batch_size,
-                num_kv_heads=self.head_num,
-                max_num_pages=self.max_num_pages,
-            )
-        elif self.alloc_kernel == "lru_global":
-            vortex_torch.cache.allocate_pages_lru_global(
-                sparse_kv_indices=sparse_kv_indices,
-                sparse_kv_indptr=sparse_kv_indptr,
-                cpu_to_gpu_slot_map=cpu_to_gpu_map,
-                gpu_to_cpu_page_map=gpu_to_cpu_map,
-                slot_ages=self.slot_ages[local_id],
-                slots_used_bitmap=self.slots_used_bitmaps[local_id],
-                needs_eviction_bitmap=self.needs_eviction_bitmaps[local_id],
-                dst_gpu_slots=dst_staging_slots,
-                owners_bitmap=self.temp_owners_bitmap,
-                evicted_cpu_pages=self.temp_evicted_cpu_pages,
-                overflow_flag=self.temp_overflow_flag,
-                batch_size=batch_size,
-                num_kv_heads=self.head_num,
-                max_num_pages=self.max_num_pages,
-            )
-        elif self.alloc_kernel == "lru_block_global":
-            vortex_torch.cache.allocate_pages_lru_block_global(
                 sparse_kv_indices=sparse_kv_indices,
                 sparse_kv_indptr=sparse_kv_indptr,
                 cpu_to_gpu_slot_map=cpu_to_gpu_map,
@@ -489,12 +576,46 @@ class CPUVTXGraphTokenToKVPool(KVCache):
                 num_kv_heads=self.head_num,
                 max_num_pages=self.max_num_pages,
             )
+            alloc_owners_bitmap = self.temp_owners_bitmap
+            alloc_evicted_cpu_pages = self.temp_evicted_cpu_pages
+            alloc_overflow_flag = self.temp_overflow_flag
+        elif self.alloc_kernel == "lru_global":
+            vortex_torch.cache.allocate_pages_lru_global(
+                sparse_kv_indices=sparse_kv_indices,
+                sparse_kv_indptr=sparse_kv_indptr,
+                cpu_to_gpu_slot_map=cpu_to_gpu_map,
+                gpu_to_cpu_page_map=gpu_to_cpu_map,
+                slot_ages=self.slot_ages[local_id],
+                set_used_mask=self.set_used_masks[local_id],
+                dst_gpu_slots=dst_staging_slots,
+                owners_bitmap=self.temp_owners_bitmap,
+                evicted_cpu_pages=self.temp_evicted_cpu_pages,
+                overflow_flag=self.temp_overflow_flag,
+                batch_size=batch_size,
+                num_kv_heads=self.head_num,
+                max_num_pages=self.max_num_pages,
+            )
+            alloc_owners_bitmap = self.temp_owners_bitmap
+            alloc_evicted_cpu_pages = self.temp_evicted_cpu_pages
+            alloc_overflow_flag = self.temp_overflow_flag
+        else:
+            # Policy-agnostic allocation via StagingCache (lru/lfu/random_block_global)
+            self.staging_caches[local_id].allocate(
+                sparse_kv_indices=sparse_kv_indices,
+                sparse_kv_indptr=sparse_kv_indptr,
+                dst_gpu_slots=dst_staging_slots,
+                owners_bitmap=self.temp_owners_bitmap,
+                evicted_cpu_pages=self.temp_evicted_cpu_pages,
+                overflow_flag=self.temp_overflow_flag,
+                batch_size=batch_size,
+                num_kv_heads=self.head_num,
+            )
+            alloc_owners_bitmap = self.temp_owners_bitmap
+            alloc_evicted_cpu_pages = self.temp_evicted_cpu_pages
+            alloc_overflow_flag = self.temp_overflow_flag
 
         if self.profile_enabled:
             end_alloc.record()
-            num_pages = sparse_kv_indptr[batch_size * self.head_num].item()
-            miss_count = self.temp_owners_bitmap[:num_pages].sum().item()
-            hit_rate = 1.0 - miss_count / num_pages if num_pages > 0 else 0.0
             start_copy = torch.cuda.Event(enable_timing=True)
             end_copy = torch.cuda.Event(enable_timing=True)
             start_copy.record()
@@ -508,8 +629,8 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             sparse_kv_indices=sparse_kv_indices,
             sparse_kv_indptr=sparse_kv_indptr,
             dst_gpu_slots=dst_staging_slots,
-            owners_bitmap=self.temp_owners_bitmap,
-            evicted_cpu_pages=self.temp_evicted_cpu_pages,
+            owners_bitmap=alloc_owners_bitmap,
+            evicted_cpu_pages=alloc_evicted_cpu_pages,
             page_size=self.page_size,
             batch_size=batch_size,
             num_kv_heads=self.head_num,
@@ -518,24 +639,17 @@ class CPUVTXGraphTokenToKVPool(KVCache):
 
         if self.profile_enabled:
             end_copy.record()
-            torch.cuda.synchronize()
-            alloc_ms = start_alloc.elapsed_time(end_alloc)
-            copy_ms = start_copy.elapsed_time(end_copy)
-            self.profile_tokens_generated += batch_size
-            import json
-            record = {
-                "tokens": self.profile_tokens_generated,
-                "layer_id": layer_id,
-                "alloc_ms": alloc_ms,
-                "copy_ms": copy_ms,
-                "hit_rate": hit_rate,
-                "num_pages": num_pages,
-            }
-            self._profile_file.write(json.dumps(record) + "\n")
-            self._profile_file.flush()
+            # NO sync here — events will be read after the attention backend's sync.
+            # Store pending events for deferred reading.
+            if not hasattr(self, '_pending_profile_events'):
+                self._pending_profile_events = []
+            self._pending_profile_events.append((
+                start_alloc, end_alloc, start_copy, end_copy,
+                _hit_rate_tensor, layer_id, batch_size
+            ))
 
         # Check for staging buffer overflow (only when CUDA graph is disabled)
-        if self.enable_overflow_check and self.temp_overflow_flag.item() != 0:
+        if self.enable_overflow_check and alloc_overflow_flag.item() != 0:
             raise RuntimeError(
                 f"GPU staging buffer overflow in copy_sparse_kv_to_gpu_with_indptr. "
                 f"layer_id={layer_id}, batch_size={batch_size}, "
@@ -543,7 +657,16 @@ class CPUVTXGraphTokenToKVPool(KVCache):
                 f"This indicates max_num_reqs exceeds GPU staging buffer capacity."
             )
 
-        return gpu_k, gpu_v, dst_staging_slots
+        # For int8: return persistent GPU scale buffers and the gpu_to_cpu page map.
+        # The paged_decode_int8 kernel resolves scale page IDs on-the-fly via
+        # the page map (staging slot → CPU flat page ID), so no remap/copy needed.
+        if self.is_int8:
+            k_scale = self.cache_scale[local_id]["k_scale"]
+            v_scale = self.cache_scale[local_id]["v_scale"]
+            gpu_to_cpu_map = self.gpu_to_cpu_page_maps[local_id]
+            return gpu_k, gpu_v, dst_staging_slots, k_scale, v_scale, gpu_to_cpu_map
+
+        return gpu_k, gpu_v, dst_staging_slots, None, None, None
 
     def _close_profile_file(self):
         """Close profile file on process exit."""
@@ -564,8 +687,16 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         layer_id = layer.layer_id
         local_id, layer_type = self.layers_mapping[layer_id]
 
+        if self.is_int8:
+            self._set_kv_buffer_int8(local_id, layer_type, loc, cache_k, cache_v)
+        elif self.is_fp8:
+            self._set_kv_buffer_fp8(local_id, layer_type, loc, cache_k, cache_v, k_scale, v_scale)
+        else:
+            self._set_kv_buffer_bf16(local_id, layer_type, loc, cache_k, cache_v)
+
+    def _set_kv_buffer_bf16(self, local_id, layer_type, loc, cache_k, cache_v):
+        """BF16 path: original implementation."""
         if layer_type == 'cpu_sparse':
-            # CPU sparse layer: store to CPU + update GPU staging if cached
             cpu_k_buffer = self.cache_cpu[local_id]["k"]
             cpu_v_buffer = self.cache_cpu[local_id]["v"]
             gpu_k_staging = self.cache_staging[local_id]["k"]
@@ -573,63 +704,216 @@ class CPUVTXGraphTokenToKVPool(KVCache):
             cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[local_id]
 
             vortex_torch.cache.store_kv_cpu_and_gpu(
-                cpu_k_buffer,
-                cpu_v_buffer,
-                gpu_k_staging,
-                gpu_v_staging,
-                cache_k.contiguous(),
-                cache_v.contiguous(),
-                loc,
-                self.page_size,
-                cpu_to_gpu_map,
-                self.max_page_id_sparse,
+                cpu_k_buffer, cpu_v_buffer,
+                gpu_k_staging, gpu_v_staging,
+                cache_k.contiguous(), cache_v.contiguous(),
+                loc, self.page_size, cpu_to_gpu_map, self.max_page_id_sparse,
             )
 
             unified_cache = {
-                "k": UnifiedCacheView(
-                    cpu_k_buffer,
-                    gpu_k_staging,
-                    cpu_to_gpu_map
-                ),
-                "v": UnifiedCacheView(
-                    cpu_v_buffer,
-                    gpu_v_staging,
-                    cpu_to_gpu_map
-                ),
+                "k": UnifiedCacheView(cpu_k_buffer, gpu_k_staging, cpu_to_gpu_map),
+                "v": UnifiedCacheView(cpu_v_buffer, gpu_v_staging, cpu_to_gpu_map),
                 "centroids": self.cache_staging[local_id]["centroids"]
             }
-
             self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
 
         elif layer_type == 'gpu_sparse':
-            # GPU sparse layer: store directly to GPU + update landmarks
             cache = self.cache_gpu_sparse[local_id]
-            k_buffer = cache["k"]
-            v_buffer = cache["v"]
             vortex_torch.cache.set_kv_buffer_launcher(
-                k_buffer,
-                v_buffer,
-                cache_k.contiguous(),
-                cache_v.contiguous(),
-                loc,
-                self.page_size
+                cache["k"], cache["v"],
+                cache_k.contiguous(), cache_v.contiguous(),
+                loc, self.page_size,
             )
-            # Update landmarks for sparse indexing
             self.sparse_attention.forward_cache(cache, loc, ctx=self.ctx)
 
         else:  # full attention
-            # Full attention layer: store directly to GPU, no landmarks
-            k_buffer = self.k_buffer_full[local_id]
-            v_buffer = self.v_buffer_full[local_id]
             vortex_torch.cache.set_kv_buffer_launcher(
-                k_buffer,
-                v_buffer,
-                cache_k.contiguous(),
-                cache_v.contiguous(),
-                loc,
-                self.page_size
+                self.k_buffer_full[local_id], self.v_buffer_full[local_id],
+                cache_k.contiguous(), cache_v.contiguous(),
+                loc, self.page_size,
             )
-            # Note: No forward_cache call for full attention layers (no landmarks)
+
+    def _set_kv_buffer_int8(self, local_id, layer_type, loc, cache_k, cache_v):
+        """Int8 path: quantize bf16→int8, store to appropriate caches."""
+        cache_k_contig = cache_k.contiguous()
+        cache_v_contig = cache_v.contiguous()
+
+        if layer_type == 'cpu_sparse':
+            # Quantize bf16→int8, write to CPU + GPU staging + persistent scales
+            store_kv_cpu_and_gpu_int8(
+                self.cache_cpu[local_id]["k"], self.cache_cpu[local_id]["v"],
+                self.cache_staging[local_id]["k"], self.cache_staging[local_id]["v"],
+                self.cache_scale[local_id]["k_scale"], self.cache_scale[local_id]["v_scale"],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size,
+                self.cpu_to_gpu_slot_maps[local_id], self.max_page_id_sparse,
+            )
+            # Dequant affected pages from staging int8 → bf16 working buffer for forward_cache
+            self._dequant_for_forward_cache(
+                local_id, self.cache_staging[local_id], self.cache_scale[local_id],
+                self.cpu_to_gpu_slot_maps[local_id], loc,
+            )
+            cache_for_forward = {k: v for k, v in self.cache_staging[local_id].items()}
+            cache_for_forward["k"] = self._k_bf16_working
+            self.sparse_attention.forward_cache(cache_for_forward, loc, ctx=self.ctx)
+
+        elif layer_type == 'gpu_sparse':
+            cache = self.cache_gpu_sparse[local_id]
+            set_kv_buffer_int8_launcher(
+                cache["k"], cache["v"],
+                cache["k_scale"], cache["v_scale"],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size,
+            )
+            # Dequant affected pages for forward_cache
+            self._dequant_for_forward_cache_direct(cache, loc)
+            cache_for_forward = {k: v for k, v in cache.items()}
+            cache_for_forward["k"] = self._k_bf16_working
+            self.sparse_attention.forward_cache(cache_for_forward, loc, ctx=self.ctx)
+
+        else:  # full attention
+            set_kv_buffer_int8_launcher(
+                self.k_buffer_full[local_id], self.v_buffer_full[local_id],
+                self.k_scale_full[local_id], self.v_scale_full[local_id],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size,
+            )
+
+    def _dequant_for_forward_cache_direct(self, cache, loc):
+        """Dequant int8 K pages to _k_bf16_working for forward_cache (GPU-resident cache)."""
+        token_page_ids = loc // self.page_size
+        if torch.cuda.is_current_stream_capturing():
+            unique_page_ids = token_page_ids
+        else:
+            unique_page_ids = torch.unique(token_page_ids)
+        flat_page_ids = (
+            unique_page_ids[:, None] * self.head_num
+            + torch.arange(self.head_num, device=loc.device)[None, :]
+        ).reshape(-1)
+        dequant_paged_int8_to_bf16_inplace(
+            cache["k"], cache["k_scale"],
+            self._k_bf16_working,
+            flat_page_ids.to(torch.int32),
+            self.page_size, self.head_dim,
+        )
+
+    def _dequant_for_forward_cache(self, local_id, staging_cache, scale_cache, cpu_to_gpu_map, loc):
+        """Dequant int8 K pages to _k_bf16_working for forward_cache.
+
+        CPU sparse layers have TWO index spaces: staging slots (for int8 data
+        in GPU staging) and CPU flat page IDs (for data in CPU pinned memory,
+        plus scales and forward_cache access).
+
+        During prefill, cpu_to_gpu_slot_map starts all -1, so NO pages are in
+        staging — we read from CPU pinned memory via the CUDA dequant kernel.
+        During decode, most pages are in staging but some may have been evicted.
+
+        Uses:
+        - Triton kernel (separate data/scale/dst indices) for staging-resident pages
+        - CUDA C++ kernel (dequant_int8_cpu_to_bf16) for CPU-resident pages
+        Both are CUDA graph compatible (no Python CPU↔GPU sync).
+        """
+        token_page_ids = loc // self.page_size
+        if torch.cuda.is_current_stream_capturing():
+            unique_page_ids = token_page_ids
+        else:
+            unique_page_ids = torch.unique(token_page_ids)
+
+        cpu_cache_k = self.cache_cpu[local_id]["k"]  # int8, CPU pinned
+
+        for head_id in range(self.head_num):
+            flat_cpu_pages = unique_page_ids * self.head_num + head_id
+            staging_slots = cpu_to_gpu_map[flat_cpu_pages]
+
+            if torch.cuda.is_current_stream_capturing():
+                # CUDA graph: cannot branch on data. Assume pages in staging
+                # (decode tokens should always be in staging for active requests).
+                safe_slots = staging_slots.clamp(min=0)
+                # Triton kernel with separate indices: data at staging slots,
+                # scales at CPU pages, destination at CPU pages.
+                dequant_paged_int8_to_bf16_inplace(
+                    staging_cache["k"],      # int8 data (staging-slot-indexed)
+                    scale_cache["k_scale"],  # scales (CPU-page-indexed)
+                    self._k_bf16_working,    # destination (CPU-page-indexed)
+                    safe_slots.to(torch.int32),       # data page IDs
+                    self.page_size, self.head_dim,
+                    scale_page_indices=flat_cpu_pages.to(torch.int32),  # scale page IDs
+                    dst_page_indices=flat_cpu_pages.to(torch.int32),    # dst page IDs
+                )
+            else:
+                in_staging = staging_slots >= 0
+                # Pages in staging: Triton kernel with separate indices
+                if in_staging.any():
+                    s = staging_slots[in_staging].to(torch.int32)
+                    c = flat_cpu_pages[in_staging].to(torch.int32)
+                    dequant_paged_int8_to_bf16_inplace(
+                        staging_cache["k"], scale_cache["k_scale"],
+                        self._k_bf16_working,
+                        s, self.page_size, self.head_dim,
+                        scale_page_indices=c, dst_page_indices=c,
+                    )
+                # Pages NOT in staging: CUDA kernel reads from CPU pinned via UVA
+                if (~in_staging).any():
+                    c = flat_cpu_pages[~in_staging].to(torch.int32)
+                    vortex_torch.cache.dequant_int8_cpu_to_bf16(
+                        cpu_cache_k,             # CPU pinned int8
+                        scale_cache["k_scale"],  # GPU fp16 scales
+                        self._k_bf16_working,    # GPU bf16 destination
+                        c, c,                    # src=dst=CPU page IDs
+                        self.page_size, self.head_dim,
+                    )
+
+    def _set_kv_buffer_fp8(self, local_id, layer_type, loc, cache_k, cache_v, k_scale, v_scale):
+        """FP8 path: quantize bf16→fp8 (uint8), store to appropriate caches."""
+        cache_k_contig = cache_k.contiguous()
+        cache_v_contig = cache_v.contiguous()
+        k_scale_val = k_scale if isinstance(k_scale, (int, float)) else k_scale.item() if k_scale is not None else 1.0
+        v_scale_val = v_scale if isinstance(v_scale, (int, float)) else v_scale.item() if v_scale is not None else 1.0
+
+        if layer_type == 'cpu_sparse':
+            # Quantize bf16→fp8, write to CPU + GPU staging in one kernel
+            store_kv_cpu_and_gpu_fp8(
+                self.cache_cpu[local_id]["k"], self.cache_cpu[local_id]["v"],
+                self.cache_staging[local_id]["k"], self.cache_staging[local_id]["v"],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size,
+                self.cpu_to_gpu_slot_maps[local_id], self.max_page_id_sparse,
+                k_scale_val, v_scale_val, fp8_type=self.fp8_type,
+            )
+            # Use UnifiedCacheView so forward_cache reads from CPU when pages
+            # aren't in staging (e.g., during prefill when staging is empty).
+            # The unified reduce kernel now supports fp8 (quant_type 1/2).
+            self.ctx.fp8_type = self.fp8_type
+            self.ctx.kv_scale = k_scale_val
+            cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[local_id]
+            unified_cache = {
+                "k": UnifiedCacheView(self.cache_cpu[local_id]["k"],
+                                      self.cache_staging[local_id]["k"], cpu_to_gpu_map),
+                "v": UnifiedCacheView(self.cache_cpu[local_id]["v"],
+                                      self.cache_staging[local_id]["v"], cpu_to_gpu_map),
+                "centroids": self.cache_staging[local_id]["centroids"]
+            }
+            self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
+
+        elif layer_type == 'gpu_sparse':
+            cache = self.cache_gpu_sparse[local_id]
+            set_kv_buffer_fp8_launcher(
+                cache["k"], cache["v"],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size, k_scale_val, v_scale_val,
+                fp8_type=self.fp8_type,
+            )
+            self.ctx.fp8_type = self.fp8_type
+            self.ctx.kv_scale = k_scale_val
+            self.sparse_attention.forward_cache(cache, loc, ctx=self.ctx)
+
+        else:  # full attention
+            set_kv_buffer_fp8_launcher(
+                self.k_buffer_full[local_id], self.v_buffer_full[local_id],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size, k_scale_val, v_scale_val,
+                fp8_type=self.fp8_type,
+            )
 
     def set_kv_buffer_decode(
         self,
@@ -644,78 +928,148 @@ class CPUVTXGraphTokenToKVPool(KVCache):
         """Store KV during decode phase based on layer type."""
 
         assert layer_id_override is None
-        assert k_scale is None
-        assert v_scale is None
-        assert cache_k.dtype == torch.bfloat16
-        assert cache_v.dtype == torch.bfloat16
         assert loc.dtype == torch.int64
 
         layer_id = layer.layer_id
         local_id, layer_type = self.layers_mapping[layer_id]
 
+        if self.is_int8:
+            self._set_kv_buffer_decode_int8(local_id, layer_type, loc, cache_k, cache_v)
+        elif self.is_fp8:
+            self._set_kv_buffer_decode_fp8(local_id, layer_type, loc, cache_k, cache_v, k_scale, v_scale)
+        else:
+            self._set_kv_buffer_decode_bf16(local_id, layer_type, loc, cache_k, cache_v)
+
+    def _set_kv_buffer_decode_bf16(self, local_id, layer_type, loc, cache_k, cache_v):
+        """BF16 decode path."""
         if layer_type == 'cpu_sparse':
-            # CPU sparse layer: store to CPU + update GPU staging
-            cpu_k_buffer = self.cache_cpu[local_id]["k"]
-            cpu_v_buffer = self.cache_cpu[local_id]["v"]
-            gpu_k_staging = self.cache_staging[local_id]["k"]
-            gpu_v_staging = self.cache_staging[local_id]["v"]
+            cpu_k = self.cache_cpu[local_id]["k"]
+            cpu_v = self.cache_cpu[local_id]["v"]
+            gpu_k = self.cache_staging[local_id]["k"]
+            gpu_v = self.cache_staging[local_id]["v"]
             cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[local_id]
             vortex_torch.cache.store_kv_unified(
-                cpu_k_buffer,
-                cpu_v_buffer,
-                gpu_k_staging,
-                gpu_v_staging,
-                cache_k.contiguous(),
-                cache_v.contiguous(),
-                loc,
-                cpu_to_gpu_map,
-                self.page_size,
+                cpu_k, cpu_v, gpu_k, gpu_v,
+                cache_k.contiguous(), cache_v.contiguous(),
+                loc, cpu_to_gpu_map, self.page_size,
             )
             unified_cache = {
-                "k": UnifiedCacheView(
-                    cpu_k_buffer,
-                    gpu_k_staging,
-                    cpu_to_gpu_map
-                ),
-                "v": UnifiedCacheView(
-                    cpu_v_buffer,
-                    gpu_v_staging,
-                    cpu_to_gpu_map
-                ),
+                "k": UnifiedCacheView(cpu_k, gpu_k, cpu_to_gpu_map),
+                "v": UnifiedCacheView(cpu_v, gpu_v, cpu_to_gpu_map),
                 "centroids": self.cache_staging[local_id]["centroids"]
             }
-
             self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
 
         elif layer_type == 'gpu_sparse':
-            # GPU sparse layer: store directly to GPU + update landmarks
             cache = self.cache_gpu_sparse[local_id]
-            k_buffer = cache["k"]
-            v_buffer = cache["v"]
             vortex_torch.cache.set_kv_buffer_launcher(
-                k_buffer,
-                v_buffer,
-                cache_k.contiguous(),
-                cache_v.contiguous(),
-                loc,
-                self.page_size
+                cache["k"], cache["v"],
+                cache_k.contiguous(), cache_v.contiguous(),
+                loc, self.page_size,
             )
-            # Update landmarks for sparse indexing
             self.sparse_attention.forward_cache(cache, loc, ctx=self.ctx)
 
         else:  # full attention
-            # Full attention layer: store directly to GPU, no landmarks
-            k_buffer = self.k_buffer_full[local_id]
-            v_buffer = self.v_buffer_full[local_id]
             vortex_torch.cache.set_kv_buffer_launcher(
-                k_buffer,
-                v_buffer,
-                cache_k.contiguous(),
-                cache_v.contiguous(),
-                loc,
-                self.page_size
+                self.k_buffer_full[local_id], self.v_buffer_full[local_id],
+                cache_k.contiguous(), cache_v.contiguous(),
+                loc, self.page_size,
             )
-            # Note: No forward_cache call for full attention layers (no landmarks)
+
+    def _set_kv_buffer_decode_int8(self, local_id, layer_type, loc, cache_k, cache_v):
+        """Int8 decode path: quantize and store, dequant for forward_cache."""
+        cache_k_contig = cache_k.contiguous()
+        cache_v_contig = cache_v.contiguous()
+
+        if layer_type == 'cpu_sparse':
+            # Unified routing: quantize bf16→int8, route to EITHER CPU or GPU
+            # based on slot map. Scales always written to persistent GPU buffer.
+            store_kv_unified_int8(
+                self.cache_cpu[local_id]["k"], self.cache_cpu[local_id]["v"],
+                self.cache_staging[local_id]["k"], self.cache_staging[local_id]["v"],
+                self.cache_scale[local_id]["k_scale"], self.cache_scale[local_id]["v_scale"],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size,
+                self.cpu_to_gpu_slot_maps[local_id],
+            )
+            # Dequant affected pages for forward_cache (small cost for decode)
+            self._dequant_for_forward_cache(
+                local_id, self.cache_staging[local_id], self.cache_scale[local_id],
+                self.cpu_to_gpu_slot_maps[local_id], loc,
+            )
+            cache_for_forward = {k: v for k, v in self.cache_staging[local_id].items()}
+            cache_for_forward["k"] = self._k_bf16_working
+            self.sparse_attention.forward_cache(cache_for_forward, loc, ctx=self.ctx)
+
+        elif layer_type == 'gpu_sparse':
+            cache = self.cache_gpu_sparse[local_id]
+            set_kv_buffer_int8_launcher(
+                cache["k"], cache["v"],
+                cache["k_scale"], cache["v_scale"],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size,
+            )
+            self._dequant_for_forward_cache_direct(cache, loc)
+            cache_for_forward = {k: v for k, v in cache.items()}
+            cache_for_forward["k"] = self._k_bf16_working
+            self.sparse_attention.forward_cache(cache_for_forward, loc, ctx=self.ctx)
+
+        else:  # full attention
+            set_kv_buffer_int8_launcher(
+                self.k_buffer_full[local_id], self.v_buffer_full[local_id],
+                self.k_scale_full[local_id], self.v_scale_full[local_id],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size,
+            )
+
+    def _set_kv_buffer_decode_fp8(self, local_id, layer_type, loc, cache_k, cache_v, k_scale, v_scale):
+        """FP8 decode path."""
+        cache_k_contig = cache_k.contiguous()
+        cache_v_contig = cache_v.contiguous()
+        k_scale_val = k_scale if isinstance(k_scale, (int, float)) else k_scale.item() if k_scale is not None else 1.0
+        v_scale_val = v_scale if isinstance(v_scale, (int, float)) else v_scale.item() if v_scale is not None else 1.0
+
+        if layer_type == 'cpu_sparse':
+            # Unified routing: quantize bf16→fp8, route to EITHER CPU or GPU
+            store_kv_unified_fp8(
+                self.cache_cpu[local_id]["k"], self.cache_cpu[local_id]["v"],
+                self.cache_staging[local_id]["k"], self.cache_staging[local_id]["v"],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size,
+                self.cpu_to_gpu_slot_maps[local_id],
+                k_scale_val, v_scale_val, fp8_type=self.fp8_type,
+            )
+            self.ctx.fp8_type = self.fp8_type
+            self.ctx.kv_scale = k_scale_val
+            cpu_to_gpu_map = self.cpu_to_gpu_slot_maps[local_id]
+            unified_cache = {
+                "k": UnifiedCacheView(self.cache_cpu[local_id]["k"],
+                                      self.cache_staging[local_id]["k"], cpu_to_gpu_map),
+                "v": UnifiedCacheView(self.cache_cpu[local_id]["v"],
+                                      self.cache_staging[local_id]["v"], cpu_to_gpu_map),
+                "centroids": self.cache_staging[local_id]["centroids"]
+            }
+            self.sparse_attention.forward_cache(unified_cache, loc, ctx=self.ctx)
+
+        elif layer_type == 'gpu_sparse':
+            cache = self.cache_gpu_sparse[local_id]
+            set_kv_buffer_fp8_launcher(
+                cache["k"], cache["v"],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size, k_scale_val, v_scale_val,
+                fp8_type=self.fp8_type,
+            )
+            self.ctx.fp8_type = self.fp8_type
+            self.ctx.kv_scale = k_scale_val
+            self.sparse_attention.forward_cache(cache, loc, ctx=self.ctx)
+
+        else:  # full attention
+            set_kv_buffer_fp8_launcher(
+                self.k_buffer_full[local_id], self.v_buffer_full[local_id],
+                cache_k_contig, cache_v_contig,
+                loc, self.page_size, k_scale_val, v_scale_val,
+                fp8_type=self.fp8_type,
+            )
 
     def available_size(self) -> int:
         """Return available cache size."""
