@@ -89,7 +89,7 @@ def main():
 
     models = ["Qwen/Qwen3-4B", "Qwen/Qwen3-8B"]
     model_labels = ["Qwen3-4B", "Qwen3-8B"]
-    topk_values = [10, 20, 30, 50]
+    topk_values = [30, 62, 126]
 
     COLORS = {
         "Qwen3-4B": "#1565C0",

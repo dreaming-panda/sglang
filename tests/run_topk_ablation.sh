@@ -11,9 +11,9 @@ cd ~/qilong/sglang/tests
 MEM_FRAC=0.9
 MAX_TOKENS=16384
 
-TOPK_VALUES=(10 20 30 50)
+TOPK_VALUES=(30 62 126)
 MODELS=("Qwen/Qwen3-8B" "Qwen/Qwen3-4B")
-GPUS=(0 1 3 4)
+GPUS=(0 1 3)
 
 for MODEL in "${MODELS[@]}"; do
     MODEL_SHORT=$(basename "$MODEL")
