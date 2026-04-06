@@ -115,6 +115,8 @@ class KVCache(abc.ABC):
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
+        elif dtype == torch.int8:
+            self.store_dtype = torch.int8
         else:
             self.store_dtype = dtype
         self.layer_num = layer_num

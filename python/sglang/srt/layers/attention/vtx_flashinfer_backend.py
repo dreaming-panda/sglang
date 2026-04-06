@@ -119,7 +119,7 @@ class VTXFlashInferAttnBackend(AttentionBackend):
         
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.page_size = model_runner.server_args.page_size
-        self.layers_skip =  model_runner.server_args.vortex_layers_skip
+        self.layers_skip = model_runner.server_args.vortex_layers_skip
         
         self.kv_indptr = [
                 torch.zeros(
@@ -234,6 +234,20 @@ class VTXFlashInferAttnBackend(AttentionBackend):
                     req_to_token=self.req_to_token,
                     req_indices=forward_batch.req_pool_indices
             )
+                
+                # print(f"bs: {bs}")
+                # print(f"num_kv_heads: {self.num_kv_heads}")
+                # print(f"dense_kv_indptr.shape: {self.kv_indptr[1].shape}")
+                # print(f"sparse_kv_indptr.shape: {self.kv_indptr[0].shape}")
+                # print(f"dense_kv_indptr used: {self.kv_indptr[1][:bs * self.num_kv_heads + 1].shape}")
+                # print(f"sparse_kv_indptr used: {self.kv_indptr[0][:bs * self.num_kv_heads + 1].shape}")
+                # print(f"dense_kv_indptr: {self.kv_indptr[1][:bs * self.num_kv_heads + 1]}")
+                # print(f"sparse_kv_indptr: {self.kv_indptr[0][:bs * self.num_kv_heads + 1]}")
+                # print(f"kv_last_page_len.shape: {self.kv_last_page_len[1].shape}")
+                # print(f"kv_last_page_len used: {self.kv_last_page_len[1][:bs * self.num_kv_heads].shape}")
+                # print(f"req_to_token.shape: {self.req_to_token.shape}")
+                # print(f"req_indices.shape: {forward_batch.req_pool_indices.shape}")
+                # print(f"cached_seq_lens.shape: {forward_batch.seq_lens.shape}")
             
             
             self.decode_wrappers[0].plan(
@@ -265,7 +279,6 @@ class VTXFlashInferAttnBackend(AttentionBackend):
             #print(f"flashinfer workload: dense {workload} MB; sparse {sparse_workload} MB.")
             
             self.forward_metadata = DecodeMetadata(use_sparsity=True)
-            
         
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -307,7 +320,6 @@ class VTXFlashInferAttnBackend(AttentionBackend):
                 non_blocking=True,
             )
             
-
             self.forward_metadata = PrefillMetadata(extend_no_prefix)
 
     def init_cuda_graph_state(
@@ -409,9 +421,9 @@ class VTXFlashInferAttnBackend(AttentionBackend):
 
 
         if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -428,6 +440,8 @@ class VTXFlashInferAttnBackend(AttentionBackend):
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
         
+        bs = len(forward_batch.req_pool_indices)
+        # print(bs)
         use_sparsity = (self.forward_metadata.use_sparsity) and (layer.layer_id not in self.layers_skip)
         
         if k is not None:
@@ -441,7 +455,10 @@ class VTXFlashInferAttnBackend(AttentionBackend):
         if use_sparsity:
             q = q.view(-1, self.num_attn_groups, layer.head_dim).contiguous()
             landmarks = forward_batch.token_to_kv_pool.get_landmark_buffer(layer.layer_id)
-            
+
+            # if layer.layer_id == 1:
+            #     print("first", self.kv_indices[0][:self.kv_indptr[0][1].item() - self.kv_indptr[0][0].item()])
+
             self.vtx_api.get_sparse_kv_indices(
                 query=q,
                 landmarks=landmarks,
@@ -450,6 +467,9 @@ class VTXFlashInferAttnBackend(AttentionBackend):
                 sparse_kv_indptr=self.kv_indptr[0],
                 sparse_kv_indices=self.kv_indices[0]
             )
+            #torch.cuda.synchronize()
+            # if layer.layer_id == 1:
+            #     print("second", self.kv_indices[0][:self.kv_indptr[0][1].item() - self.kv_indptr[0][0].item()])
             
             self.decode_wrappers[0]._paged_kv_indices_buf = self.kv_indices[0]
             o = self.decode_wrappers[0].forward(

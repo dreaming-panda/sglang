@@ -641,6 +641,8 @@ class VTXCGAttnBackend(AttentionBackend):
         assert isinstance(forward_batch.token_to_kv_pool, VTXTokenToKVPool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
+        _profile = self.is_profiling
+        pool = forward_batch.token_to_kv_pool
 
         # Optionally write incoming K/V to decode cache
         if k is not None:
@@ -655,6 +657,11 @@ class VTXCGAttnBackend(AttentionBackend):
 
         # Decide whether to use sparsity on this layer
         use_sparsity = (layer.layer_id not in self.layers_skip)
+
+        if _profile:
+            _ev_attn_start = torch.cuda.Event(enable_timing=True)
+            _ev_attn_end = torch.cuda.Event(enable_timing=True)
+            _ev_attn_start.record()
 
         if use_sparsity:
             # Prepare Q in grouped shape expected by sparse path
@@ -692,5 +699,16 @@ class VTXCGAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale,
             )
 
+        if _profile:
+            _ev_attn_end.record()
+            torch.cuda.synchronize()
+            _attn_ms = _ev_attn_start.elapsed_time(_ev_attn_end)
+            self._step_attn_ms = getattr(self, '_step_attn_ms', 0.0) + _attn_ms
+
         # Restore to merged head dimension
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+    
+    
+    def _get_wrapper_idx(self, layer: RadixAttention):
+        
+        return 0 if layer.layer_id in self.layers_skip else 1

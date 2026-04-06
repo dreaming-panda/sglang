@@ -958,14 +958,224 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         elif self.server_args.enable_vortex_sparsity:
-            
-            cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * self.model_config.head_dim
-                    * num_layers
-                    * self.sparse_attention.get_token_ratio(self.page_size, self.model_config.head_dim)
-                    * torch._utils._element_size(self.kv_cache_dtype)
+            # For vortex: calculate based on GPU staging buffer + landmark buffer
+            num_kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+
+            # For CPU-cached vortex: GPU staging determines batch size, CPU must support it
+            if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
+                import psutil
+
+                page_size = self.server_args.page_size
+                context_len = self.model_config.context_len
+                dtype_size = torch._utils._element_size(self.kv_cache_dtype)
+
+                # Estimate average context length per request.
+                # Prompt is typically short; most context comes from generation.
+                # Use vortex_max_seq_lens if set, otherwise context_len // 64 + context_len // 4.
+                max_gen = self.server_args.vortex_max_seq_lens
+                if max_gen > 0:
+                    effective_context_len = context_len // 64 + max_gen
+                else:
+                    effective_context_len = context_len // 64 + context_len // 4
+                effective_context_len = min(effective_context_len, context_len)
+
+                # Layer configuration:
+                # 1. Full attention layers (vortex_layers_skip) - dense attention, full GPU KV
+                # 2. GPU sparse layers (from 1-cpu_percentage) - sparse attention, full GPU KV, no copying
+                # 3. CPU sparse layers (from cpu_percentage) - sparse attention, CPU KV with GPU staging
+                explicit_layer_skip = set(self.server_args.vortex_layers_skip or [])
+                non_skip_layers = sorted([i for i in range(num_layers) if i not in explicit_layer_skip])
+
+                cpu_percentage = self.server_args.vortex_cpu_percentage
+                num_cpu_sparse_layers = int(cpu_percentage * len(non_skip_layers))
+                num_gpu_sparse_layers = len(non_skip_layers) - num_cpu_sparse_layers
+
+                # CPU sparse layers from the start, GPU sparse layers from the end
+                cpu_sparse_layer_ids = non_skip_layers[:num_cpu_sparse_layers]
+                gpu_sparse_layer_ids = non_skip_layers[num_cpu_sparse_layers:]
+
+                # Store layer classification for pool and backend
+                self.full_attention_layer_ids = sorted(list(explicit_layer_skip))
+                self.gpu_sparse_layer_ids = gpu_sparse_layer_ids
+                self.cpu_sparse_layer_ids = cpu_sparse_layer_ids
+
+                # For memory calculation:
+                # - Full attention layers + GPU sparse layers: both need full GPU KV cache
+                # - CPU sparse layers: need CPU KV cache + GPU staging buffer
+                num_full_gpu_layers = len(explicit_layer_skip) + num_gpu_sparse_layers
+                num_cpu_sparse = num_cpu_sparse_layers
+
+                # K/V bytes per token per layer (dtype-aware)
+                head_dim = self.model_config.head_dim
+                if self.kv_cache_dtype == torch.int8:
+                    # int8 K+V (1 byte each) + fp16 scales (2 bytes each, 1 per token per head for K and V)
+                    kv_bytes_per_token_per_layer = num_kv_heads * (head_dim * 2 * 1 + 2 * 2)
+                elif self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    # fp8/uint8 K+V (1 byte each), no per-token scales
+                    kv_bytes_per_token_per_layer = num_kv_heads * head_dim * 2 * 1
+                else:
+                    kv_bytes_per_token_per_layer = (
+                        num_kv_heads * head_dim * 2 * dtype_size
+                    )
+
+                # GPU staging: pages_per_request tokens per concurrent request (sparse layers only)
+                pages_per_request = (
+                    self.server_args.vortex_topk_val
+                    + self.server_args.vortex_page_reserved_bos
+                    + self.server_args.vortex_page_reserved_eos
                 )
+                tokens_per_request_gpu = pages_per_request * page_size
+
+                # Landmark bytes per token (all sparse layers need landmarks: GPU sparse + CPU sparse)
+                num_all_sparse_layers = num_gpu_sparse_layers + num_cpu_sparse
+                cache_meta_info = self.sparse_attention.get_cache_meta_info(page_size, self.model_config.head_dim)
+                landmark_bytes_per_page = 0
+                for cache_name, cache_shape in cache_meta_info.items():
+                    if cache_name not in ["k", "v"]:
+                        # Landmarks/centroids are ALWAYS bf16, regardless of KV cache dtype
+                        landmark_bytes_per_page += cache_shape[0] * cache_shape[1] * 2  # bf16 = 2 bytes
+                # Scale by all sparse layers (GPU sparse + CPU sparse)
+                landmark_bytes_per_token = landmark_bytes_per_page * num_kv_heads * num_all_sparse_layers / page_size
+
+                # Available GPU memory
+                rest_gpu_memory = available_gpu_memory - total_gpu_memory * (1 - self.mem_fraction_static)
+                available_gpu_bytes = rest_gpu_memory * (1 << 30)
+
+                # Subtract fixed overhead: FlashInfer workspace (truly fixed, not per-req)
+                fixed_overhead = 512 * 1024 * 1024  # FlashInfer workspace
+                available_gpu_bytes -= fixed_overhead
+
+                # Per-request overhead from attention backend allocations
+                # (these scale with max_reqs but aren't part of the KV cache itself)
+                bytes_per_req_backend = 0
+                bytes_per_req_backend += 2 * pages_per_request * page_size * num_kv_heads * head_dim * 2  # sparse_prefill bufs (bf16)
+                bytes_per_req_backend += 2 * (num_kv_heads * context_len // page_size) * 4  # kv_indices_decode buffers
+                bytes_per_req_backend += (context_len + 4) * 8  # req_to_token_pool
+                if self.kv_cache_dtype == torch.int8:
+                    group_size = self.model_config.num_attention_heads // (get_attention_tp_size() * num_kv_heads)
+                    bytes_per_req_backend += num_kv_heads * group_size * 8 * head_dim * 4  # att_out_buf
+                    bytes_per_req_backend += num_kv_heads * group_size * 8 * 4  # att_lse_buf
+
+                # Available CPU memory
+                total_cpu_memory = psutil.virtual_memory().available
+                usable_cpu_bytes = int(total_cpu_memory * self.server_args.cpu_mem_fraction)
+
+                # Memory per request formula:
+                # GPU = ctx * kv_per_layer * (full_layers + gpu_sparse_layers)  (full GPU KV)
+                #     + 2 * staging_tokens * kv_data_per_layer * cpu_sparse_layers (2x safety for LRU)
+                #     + ctx * scale_per_layer * cpu_sparse_layers (int8: persistent scales for ALL pages on GPU)
+                #     + ctx * landmark_per_token (all sparse layers)
+                # CPU = ctx * kv_per_layer * cpu_sparse_layers
+                staging_safety_factor = self.server_args.vortex_staging_factor
+                bytes_per_req_full_gpu = effective_context_len * kv_bytes_per_token_per_layer * num_full_gpu_layers
+
+                # For int8 cpu_sparse: staging only holds int8 KV data, but scales are on GPU for ALL pages
+                if self.kv_cache_dtype == torch.int8:
+                    kv_data_bytes_per_token_per_layer = num_kv_heads * head_dim * 2  # int8 K+V only
+                    scale_bytes_per_token_per_layer = num_kv_heads * 2 * 2  # fp16 k_scale + v_scale
+                    bytes_per_req_staging = staging_safety_factor * tokens_per_request_gpu * kv_data_bytes_per_token_per_layer * num_cpu_sparse
+                    # Persistent scales on GPU for ALL cpu sparse pages (not just staging)
+                    bytes_per_req_scales_gpu = effective_context_len * scale_bytes_per_token_per_layer * num_cpu_sparse
+                else:
+                    bytes_per_req_staging = staging_safety_factor * tokens_per_request_gpu * kv_bytes_per_token_per_layer * num_cpu_sparse
+                    bytes_per_req_scales_gpu = 0
+
+                # Int8: shared bf16 K working buffer for forward_cache dequant (single buffer, not per-layer)
+                # Size proportional to max(staging_pages, full_pages) which is ~ max_reqs * effective_context_len
+                # FP8 doesn't need this: uses fp8-aware unified reduce kernel with UnifiedCacheView.
+                if self.kv_cache_dtype == torch.int8:
+                    bytes_per_req_bf16_working = effective_context_len * num_kv_heads * head_dim * 2  # bf16, single buffer
+                else:
+                    bytes_per_req_bf16_working = 0
+
+                bytes_per_req_landmark = effective_context_len * landmark_bytes_per_token
+                total_bytes_per_req_gpu = bytes_per_req_full_gpu + bytes_per_req_staging + bytes_per_req_scales_gpu + bytes_per_req_bf16_working + bytes_per_req_landmark + bytes_per_req_backend
+
+                bytes_per_req_cpu = effective_context_len * kv_bytes_per_token_per_layer * num_cpu_sparse
+
+                print(
+                    f"CPU VTX memory debug: available_gpu_bytes={available_gpu_bytes/(1<<30):.2f}GB, "
+                    f"fixed_overhead={fixed_overhead/(1<<30):.2f}GB, "
+                    f"bytes_per_req_full_gpu={bytes_per_req_full_gpu/(1<<20):.1f}MB, "
+                    f"bytes_per_req_staging={bytes_per_req_staging/(1<<20):.1f}MB, "
+                    f"bytes_per_req_scales_gpu={bytes_per_req_scales_gpu/(1<<20):.1f}MB, "
+                    f"bytes_per_req_bf16_working={bytes_per_req_bf16_working/(1<<20):.1f}MB, "
+                    f"bytes_per_req_landmark={bytes_per_req_landmark/(1<<20):.1f}MB, "
+                    f"bytes_per_req_backend={bytes_per_req_backend/(1<<20):.1f}MB, "
+                    f"total_bytes_per_req_gpu={total_bytes_per_req_gpu/(1<<20):.1f}MB, "
+                    f"num_full_gpu_layers={num_full_gpu_layers}, num_cpu_sparse={num_cpu_sparse}, "
+                    f"effective_context_len={effective_context_len}, "
+                    f"kv_bytes_per_token_per_layer={kv_bytes_per_token_per_layer}, "
+                    f"tokens_per_request_gpu={tokens_per_request_gpu}"
+                )
+                max_reqs_from_gpu = int(available_gpu_bytes / total_bytes_per_req_gpu) if total_bytes_per_req_gpu > 0 else 10000
+                # CPU memory is shared across all TP ranks, so multiply by tp_size
+                # Also apply 2x safety factor for CUDA pinned memory overhead (~2x RSS observed)
+                pinned_memory_factor = 2
+                total_bytes_per_req_cpu = bytes_per_req_cpu * self.tp_size * pinned_memory_factor
+                max_reqs_from_cpu = int(usable_cpu_bytes / total_bytes_per_req_cpu) if total_bytes_per_req_cpu > 0 else 10000
+
+                # CPU must NOT be the bottleneck - if it is, error out
+                if max_reqs_from_cpu < max_reqs_from_gpu and num_cpu_sparse > 0:
+                    raise ValueError(
+                        f"CPU memory insufficient for CPU VTX backend. "
+                        f"GPU can support {max_reqs_from_gpu} requests but CPU only {max_reqs_from_cpu}. "
+                        f"Increase cpu_mem_fraction (current: {self.server_args.cpu_mem_fraction}) "
+                        f"or add more system RAM."
+                    )
+
+                # GPU is the binding constraint (safety factor already included in staging calculation)
+                max_reqs = max_reqs_from_gpu
+
+                # Compute actual tokens needed for buffer initialization
+                max_tokens_cpu = max_reqs * effective_context_len  # CPU buffer (sparse layers)
+                max_tokens_gpu_staging = int(staging_safety_factor * max_reqs * tokens_per_request_gpu)  # GPU staging
+                max_tokens_gpu_full = max_reqs * effective_context_len  # GPU full attention (exact)
+
+                print(
+                    f"CPU VTX memory: max_reqs={max_reqs}, "
+                    f"max_tokens_cpu={max_tokens_cpu}, max_tokens_gpu_staging={max_tokens_gpu_staging}, "
+                    f"max_tokens_gpu_full={max_tokens_gpu_full}, "
+                    f"full_attn_layers={len(self.full_attention_layer_ids)}, "
+                    f"gpu_sparse_layers={len(self.gpu_sparse_layer_ids)}, "
+                    f"cpu_sparse_layers={len(self.cpu_sparse_layer_ids)}, "
+                    f"cpu_percentage={cpu_percentage:.2f}, "
+                    f"gpu_constraint={max_reqs_from_gpu}, cpu_constraint={max_reqs_from_cpu}, "
+                    f"effective_context_len={effective_context_len}, tp_size={self.tp_size}, "
+                    f"gpu_mem={rest_gpu_memory:.2f}GB, cpu_mem={usable_cpu_bytes/(1<<30):.2f}GB (shared across TP)"
+                )
+                return (max_tokens_cpu, max_tokens_gpu_staging, max_tokens_gpu_full)
+            else:
+                # Standard vortex: GPU stores full KV cache + landmark buffer
+                head_dim = self.model_config.head_dim
+                token_ratio = self.sparse_attention.get_token_ratio(self.page_size, head_dim)
+                if self.kv_cache_dtype == torch.int8:
+                    # Per-layer per-token per-head costs
+                    bytes_kv = head_dim * 1 * 2           # int8 K + V (1 byte each)
+                    bytes_scales = 2 * 2                  # fp16 K + V scales
+                    custom_ratio = token_ratio - 2.0
+                    bytes_custom = int(head_dim * custom_ratio * 2)  # bf16 custom caches
+                    per_layer_per_head = bytes_kv + bytes_scales + bytes_custom
+
+                    # Shared buffers (NOT per-layer): _k_bf16_working, prefill_k_workspace, prefill_v_workspace
+                    # Each is bf16, shape (num_pages, page_size, head_dim) -> head_dim * 2 bytes per token per head
+                    shared_per_head = head_dim * 2 * 3    # 3 shared bf16 buffers
+
+                    cell_size = num_kv_heads * (per_layer_per_head * num_layers + shared_per_head)
+                elif self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    # FP8 KV cache: fp8 k/v (1 byte each), no scale buffers, no shadow buffer.
+                    # Custom caches (centroids, max, min) stored as bf16.
+                    bytes_kv = head_dim * 1 * 2           # fp8 K + V (1 byte each)
+                    bytes_per_token_per_head = bytes_kv
+                    custom_ratio = token_ratio - 2.0
+                    bytes_custom = int(head_dim * custom_ratio * 2)  # bf16 custom caches
+                    cell_size = num_kv_heads * (bytes_per_token_per_head + bytes_custom) * num_layers
+                else:
+                    cell_size = (
+                        num_kv_heads * head_dim * num_layers
+                        * token_ratio
+                        * torch._utils._element_size(self.kv_cache_dtype)
+                    )
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -977,6 +1187,29 @@ class ModelRunner:
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
+
+        # Subtract fixed overhead for GPU VTX (sparse prefill buffers, workspace, etc.)
+        if self.server_args.enable_vortex_sparsity and self.server_args.attention_backend not in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
+            max_reqs_cap = 1024
+            page_size = self.server_args.page_size
+            head_dim = self.model_config.head_dim
+            topk_budget = (
+                self.server_args.vortex_topk_val
+                + self.server_args.vortex_page_reserved_bos
+                + self.server_args.vortex_page_reserved_eos
+            )
+            context_len = self.model_config.context_len
+            overhead = 0
+            overhead += 2 * max_reqs_cap * topk_budget * page_size * num_kv_heads * head_dim * 2  # sparse_prefill bufs (bf16)
+            overhead += 512 * 1024 * 1024  # FlashInfer workspace
+            overhead += 2 * (max_reqs_cap * num_kv_heads * context_len // page_size) * 4  # kv_indices_decode
+            overhead += max_reqs_cap * (context_len + 4) * 8  # req_to_token_pool
+            if self.kv_cache_dtype == torch.int8:
+                group_size = self.model_config.num_attention_heads // (get_attention_tp_size() * num_kv_heads)
+                overhead += max_reqs_cap * num_kv_heads * group_size * 8 * head_dim * 4  # att_out_buf
+                overhead += max_reqs_cap * num_kv_heads * group_size * 8 * 4  # att_lse_buf
+            rest_memory -= overhead / (1 << 30)
+
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
@@ -1032,12 +1265,21 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "int8":
+            self.kv_cache_dtype = torch.int8
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
-
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
+            max_total_num_tokens_cpu, max_total_num_tokens_gpu_staging, max_total_num_tokens_gpu_full = self.profile_max_num_token(total_gpu_memory)
+            self.max_total_num_tokens = max_total_num_tokens_cpu
+            self.max_total_num_tokens_gpu = max_total_num_tokens_gpu_staging
+            self.max_total_num_tokens_gpu_full = max_total_num_tokens_gpu_full
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+            self.max_total_num_tokens_gpu = None
+            self.max_total_num_tokens_gpu_full = None
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -1049,7 +1291,17 @@ class ModelRunner:
                 ),
                 4096 if not self.server_args.enable_vortex_sparsity else 1024,
             )
-            
+
+        if self.server_args.attention_backend in ["cpu_vtx_flashinfer", "cpu_vtx_cg"]:
+            pages_per_request = (
+                self.server_args.vortex_topk_val
+                + self.server_args.vortex_page_reserved_bos
+                + self.server_args.vortex_page_reserved_eos
+            )
+            tokens_per_request_gpu = pages_per_request * self.server_args.page_size
+            max_reqs_from_gpu = self.max_total_num_tokens_gpu // tokens_per_request_gpu
+            max_num_reqs = min(max_num_reqs, int(max_reqs_from_gpu / self.server_args.vortex_staging_factor))
+
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
 
@@ -1090,6 +1342,13 @@ class ModelRunner:
             // self.server_args.page_size
             * self.server_args.page_size
         )
+        
+        if self.max_total_num_tokens_gpu:
+            self.max_total_num_tokens_gpu = (
+                self.max_total_num_tokens_gpu
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
 
         # create token size for hybrid cache
         if self.is_hybrid:
@@ -1199,24 +1458,46 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
+            elif self.server_args.attention_backend == "cpu_vtx_flashinfer":
+                from sglang.srt.mem_cache.cpu_vtx_graph_memory_pool import CPUVTXGraphTokenToKVPool
+                self.token_to_kv_pool = CPUVTXGraphTokenToKVPool(
+                    size=self.max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    page_size=self.page_size,
+                    gpu_size=self.max_total_num_tokens_gpu,
+                    gpu_full_size=self.max_total_num_tokens_gpu_full,
+                    sparse_attention=self.sparse_attention,
+                    memory_saver_adapter=self.memory_saver_adapter,
+                    model_runner=self,
+                    full_attention_layer_ids=self.full_attention_layer_ids,
+                    gpu_sparse_layer_ids=self.gpu_sparse_layer_ids,
+                    cpu_sparse_layer_ids=self.cpu_sparse_layer_ids,
+                    enable_custom_mem_pool=False,
+                )
             elif self.server_args.enable_vortex_sparsity:
                     
-                    self.token_to_kv_pool = VTXGraphCachePool(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        sparse_attention=self.sparse_attention,
-                        model_runner=self,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                    )
+                self.token_to_kv_pool = VTXGraphCachePool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    sparse_attention=self.sparse_attention,
+                    model_runner=self,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
                 
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
@@ -1294,7 +1575,19 @@ class ModelRunner:
 
     # TODO unify with 6338
     def _get_attention_backend(self):
-        if self.server_args.attention_backend == "flashinfer":
+        if self.server_args.attention_backend == "cpu_vtx_flashinfer":
+            # CPU-based KV cache with Vortex sparse attention
+            # if not self.server_args.vortex_cg:
+            #     from sglang.srt.layers.attention.cpu_vtx_flashinfer_backend import (
+            #         CPUVTXFlashInferAttnBackend,
+            #     )
+            #     return CPUVTXFlashInferAttnBackend(self)
+            # else:
+            from sglang.srt.layers.attention.cpu_vtx_cg_backend import (
+                CPUVTXCGAttnBackend,
+            )
+            return CPUVTXCGAttnBackend(self)
+        elif self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
                 
                 from sglang.srt.layers.attention.vtx_graph_backend import (
@@ -1465,13 +1758,146 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> LogitsProcessorOutput:
         self.attn_backend.init_forward_metadata(forward_batch)
+
+        _profile = getattr(self.server_args, 'vortex_profile', False)
+        if _profile:
+            _step_start = torch.cuda.Event(enable_timing=True)
+            _step_end = torch.cuda.Event(enable_timing=True)
+            # Reset pending event lists
+            self.attn_backend._pending_attn_events = []
+            _pool = forward_batch.token_to_kv_pool
+            if hasattr(_pool, '_pending_profile_events'):
+                _pool._pending_profile_events = []
+            _step_start.record()
+
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
+        result = self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch, **kwargs
         )
+
+        if _profile:
+            try:
+                _step_end.record()
+                torch.cuda.synchronize()  # single sync for the entire step
+                total_ms = _step_start.elapsed_time(_step_end)
+
+                # Process pending attention events (all backends)
+                attn_ms = 0.0
+                for ev_tuple in getattr(self.attn_backend, '_pending_attn_events', []):
+                    if len(ev_tuple) == 2:
+                        # baseline / GPU-Vortex: (start, end)
+                        attn_ms += ev_tuple[0].elapsed_time(ev_tuple[1])
+                    elif len(ev_tuple) == 7:
+                        # CPU-Vortex: (cache_s, cache_e, idx_s, idx_e, attn_s, attn_e, layer_id)
+                        # Exclude cache update (ev[0]-ev[1]); include indexer + attention only
+                        attn_ms += ev_tuple[2].elapsed_time(ev_tuple[3])  # indexer/topk
+                        attn_ms += ev_tuple[4].elapsed_time(ev_tuple[5])  # attention
+
+                # Process pending pool events (CPU-Vortex alloc/copy/hit_rate)
+                _pool = forward_batch.token_to_kv_pool
+                alloc_ms = 0.0
+                copy_ms = 0.0
+                hit_rate_sum = 0.0
+                hit_rate_count = 0
+                for ev_tuple in getattr(_pool, '_pending_profile_events', []):
+                    sa, ea, sc, ec, hrt, lid, bs_ = ev_tuple
+                    alloc_ms += sa.elapsed_time(ea)
+                    copy_ms += sc.elapsed_time(ec)
+                    hit_rate_sum += hrt.item()
+                    hit_rate_count += 1
+                hit_rate = (hit_rate_sum / hit_rate_count) if hit_rate_count > 0 else -1.0
+
+                other_ms = total_ms - attn_ms - alloc_ms - copy_ms
+                batch_size = forward_batch.batch_size
+
+                if not hasattr(self, '_profile_step_count'):
+                    import os, json as _json
+                    self._profile_step_count = 0
+                    self._profile_log_interval = int(os.environ.get("VORTEX_PROFILE_LOG_INTERVAL", "100"))
+                    self._profile_attn_accum = 0.0
+                    self._profile_alloc_accum = 0.0
+                    self._profile_copy_accum = 0.0
+                    self._profile_total_accum = 0.0
+                    self._profile_batch_accum = 0
+                    self._profile_hitrate_accum = 0.0
+                    self._profile_hitrate_count = 0
+                    self._profile_accum_count = 0
+                    _step_profile_path = os.environ.get("VORTEX_PROFILE_PATH", "profile_data.jsonl")
+                    _step_profile_dir = os.path.dirname(_step_profile_path) or "."
+                    _step_profile_name = os.path.splitext(os.path.basename(_step_profile_path))[0]
+                    self._step_profile_path = os.path.join(_step_profile_dir, f"{_step_profile_name}_step.jsonl")
+                    self._step_profile_file = open(self._step_profile_path, "w")
+                    import atexit
+                    atexit.register(lambda: self._step_profile_file.close() if not self._step_profile_file.closed else None)
+
+                self._profile_step_count += 1
+                self._profile_attn_accum += attn_ms
+                self._profile_alloc_accum += alloc_ms
+                self._profile_copy_accum += copy_ms
+                self._profile_total_accum += total_ms
+                self._profile_batch_accum += batch_size
+                if hit_rate >= 0:
+                    self._profile_hitrate_accum += hit_rate
+                    self._profile_hitrate_count += 1
+                self._profile_accum_count += 1
+
+                # Write per-step record
+                import json as _json
+                self._step_profile_file.write(_json.dumps({
+                    "step": self._profile_step_count,
+                    "batch_size": batch_size,
+                    "total_ms": round(total_ms, 4),
+                    "attn_ms": round(attn_ms, 4),
+                    "alloc_ms": round(alloc_ms, 4),
+                    "copy_ms": round(copy_ms, 4),
+                    "other_ms": round(other_ms, 4),
+                    "hit_rate": round(hit_rate, 4),
+                }) + "\n")
+                self._step_profile_file.flush()
+
+                if (self._profile_log_interval > 0 and
+                        self._profile_step_count % self._profile_log_interval == 0):
+                    n = self._profile_accum_count
+                    avg_attn = self._profile_attn_accum / n
+                    avg_alloc = self._profile_alloc_accum / n
+                    avg_copy = self._profile_copy_accum / n
+                    avg_total = self._profile_total_accum / n
+                    avg_other = avg_total - avg_attn - avg_alloc - avg_copy
+                    avg_bs = self._profile_batch_accum / n
+                    _backend_name = type(self.attn_backend).__name__
+                    parts = [f"bs: {avg_bs:.0f}"]
+                    parts.append(f"other: {avg_other:.2f}ms ({avg_other/avg_total*100:.1f}%)")
+                    if avg_alloc > 0.001:
+                        parts.append(f"alloc: {avg_alloc:.2f}ms ({avg_alloc/avg_total*100:.1f}%)")
+                    if avg_copy > 0.001:
+                        parts.append(f"copy: {avg_copy:.2f}ms ({avg_copy/avg_total*100:.1f}%)")
+                    parts.append(f"attn: {avg_attn:.2f}ms ({avg_attn/avg_total*100:.1f}%)")
+                    parts.append(f"total: {avg_total:.2f}ms")
+                    if self._profile_hitrate_count > 0:
+                        avg_hr = self._profile_hitrate_accum / self._profile_hitrate_count * 100
+                        parts.append(f"hit: {avg_hr:.1f}%")
+                    print(
+                        f"[Profile {_backend_name} step {self._profile_step_count}] "
+                        + " | ".join(parts),
+                        flush=True
+                    )
+                    self._profile_attn_accum = 0.0
+                    self._profile_alloc_accum = 0.0
+                    self._profile_copy_accum = 0.0
+                    self._profile_total_accum = 0.0
+                    self._profile_batch_accum = 0
+                    self._profile_hitrate_accum = 0.0
+                    self._profile_hitrate_count = 0
+                    self._profile_accum_count = 0
+            except Exception as e:
+                print(f"[Profile ERROR] {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
+        return result
 
     def forward_extend(
         self,

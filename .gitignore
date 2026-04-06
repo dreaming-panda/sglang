@@ -1,3 +1,9 @@
+benchmark_copy_kernel.py
+plot_results.py
+
+# Thesis
+thesis/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -28,6 +34,7 @@ MANIFEST
 *.json
 tests/*
 !tests/*.py
+!tests/*.sh
 *_backup.py
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -238,3 +245,5 @@ compile_commands.json
 Cargo.lock
 
 lmms-eval
+
+examples/results/

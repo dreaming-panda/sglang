@@ -72,6 +72,7 @@ class ServerArgs:
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
+    cpu_mem_fraction: Optional[float] = None  # Fraction of total CPU memory for KV cache (CPU-cached vortex)
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
@@ -188,16 +189,23 @@ class ServerArgs:
     vortex_num_selected_pages: int = 30
     vortex_topk_val: int = 30
     vortex_layers_skip: Optional[List[int]] = None
+    vortex_cpu_percentage: float = 1.0  # Fraction of non-skip layers using CPU sparse attention (0.0-1.0)
     vortex_page_reserved_bos: int = 1
     vortex_page_reserved_eos: int = 1
+    enable_cpu_vtx_cache: bool = False  # Enable LRU cache for CPU VTX staging buffer
+    vortex_alloc_kernel: str = "lru_block_global"  # Allocation kernel: "lru_block", "lru_global", or "lru_block_global"
+    vortex_staging_factor: float = 2.0  # Staging cache safety factor (multiplier on working set size)
+    vortex_profile: bool = False
+    vortex_cg: bool = False
     vortex_max_seq_lens: int = -1
     vortex_lb_max_chunk_size: int = 32
     vortex_lb_min_chunk_size: int = 8
     vortex_indexer_dtype: str = "bfloat16"
+    vortex_topk_type: str = "naive"
     vortex_module_path: str = None
     vortex_module_name: str = None
-    
-    
+
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
@@ -343,6 +351,10 @@ class ServerArgs:
             if model_config.is_multimodal:
                 self.mem_fraction_static *= 0.90
 
+        # Set CPU memory fraction for CPU-cached vortex attention
+        if self.cpu_mem_fraction is None:
+            self.cpu_mem_fraction = 0.8  # Default to 80% of total CPU memory
+
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None:
@@ -401,6 +413,12 @@ class ServerArgs:
         if self.attention_backend == "torch_native":
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
+            )
+            self.disable_cuda_graph = True
+
+        if self.vortex_profile:
+            logger.warning(
+                "Cuda graph is disabled because vortex profiling is enabled"
             )
             self.disable_cuda_graph = True
 
@@ -699,8 +717,8 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "int8"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+. "int8" stores KV in int8 with per-token scales.',
         )
         parser.add_argument(
             "--quantization",
@@ -801,6 +819,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--cpu-mem-fraction",
+            type=float,
+            default=ServerArgs.cpu_mem_fraction,
+            help="The fraction of total CPU memory to use for KV cache when using CPU-cached vortex attention. Default is 0.8 (80%%).",
         )
         parser.add_argument(
             "--max-running-requests",
@@ -1711,6 +1735,12 @@ class ServerArgs:
             nargs="+",
         )
         parser.add_argument(
+            "--vortex-cpu-percentage",
+            type=float,
+            default=ServerArgs.vortex_cpu_percentage,
+            help="Fraction of non-skip layers using CPU sparse attention (0.0-1.0)",
+        )
+        parser.add_argument(
             "--vortex-max-seq-lens",
             type=int,
             default=ServerArgs.vortex_max_seq_lens,
@@ -1741,8 +1771,20 @@ class ServerArgs:
             type=str,
             default=ServerArgs.vortex_module_name,
         )
-        
-        
+        parser.add_argument(
+            "--vortex-alloc-kernel",
+            type=str,
+            choices=["lru_block", "lru_global", "lru_block_global", "lfu_block_global", "random_block_global"],
+            default=ServerArgs.vortex_alloc_kernel,
+            help="Allocation kernel for CPU VTX staging buffer: lru_block, lru_global, lru_block_global (default), lfu_block_global, or random_block_global",
+        )
+        parser.add_argument(
+            "--vortex-staging-factor",
+            type=float,
+            default=ServerArgs.vortex_staging_factor,
+            help="Staging cache safety factor (multiplier on working set size, default 2.0)",
+        )
+
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
