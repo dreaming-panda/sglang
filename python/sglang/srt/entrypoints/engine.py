@@ -536,6 +536,13 @@ class Engine(EngineBase):
         recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
+        return recv_req.data
+
+    def get_topk_histograms(self):
+        return self.collective_rpc("get_topk_histograms")
+
+    def clear_topk_histograms(self):
+        self.collective_rpc("clear_topk_histograms")
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)

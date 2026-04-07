@@ -28,6 +28,7 @@ from sglang.srt.utils import (
 
 import vortex_torch
 from vortex_torch.abs import as_vtensor, FORMAT
+from vortex_torch.cache.triton_kernels.set_kv import set_kv_buffer_fp8_launcher
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -77,10 +78,19 @@ class VTXGraphCachePool(KVCache):
         self.custom_mem_pool = None
 
         self.num_pages = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
-        
+        self.is_int8 = (self.dtype == torch.int8)
+        self.is_fp8 = (self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2))
+        # FP8 type encoding for Triton kernels: 0=none, 1=e4m3, 2=e5m2
+        if self.dtype == torch.float8_e4m3fn:
+            self.fp8_type = 1
+        elif self.dtype == torch.float8_e5m2:
+            self.fp8_type = 2
+        else:
+            self.fp8_type = 0
+
         self.sparse_attention = sparse_attention
         self.ctx = vortex_torch.cache.Context()
-        
+
         self._create_buffers()
         self._initialize_graph(model_runner)
         self.layer_transfer_counter = None
@@ -94,56 +104,142 @@ class VTXGraphCachePool(KVCache):
         )
         
         self.mem_usage = cache_size / GB
-        assert self.dtype == torch.bfloat16
-        assert self.store_dtype == torch.bfloat16
     
     def _initialize_graph(self, model_runner) -> None:
-        
+        # Match cache dummy dtypes to actual storage:
+        # - int8 path: forward_cache sees int8 K directly; reduce kernels dequant inline (QUANT_TYPE==1).
+        # - fp8 path: forward_cache sees uint8 K/V directly.
+        # - bf16 path: everything bf16.
+        # Custom caches (centroids, max, min) are always bf16.
+        if self.is_fp8:
+            kv_store_dtype = torch.uint8
+        elif self.is_int8:
+            kv_store_dtype = torch.int8
+        else:
+            kv_store_dtype = torch.bfloat16
+
         self.ctx.create(self, model_runner)
         self.ctx.profile()
-        
+
+        # Set quant context for inline dequantization during profiling
+        if self.is_int8:
+            self.ctx.quant_type = 1
+            self.ctx.kv_scale_ptr = torch.empty((0,), dtype=torch.float16, device=self.device)
+
         try:
             with torch.no_grad():
                 loc_dummy = torch.empty((0,), dtype=torch.int64, device=self.device)
                 cache_dummy = {
                         cache_name:  as_vtensor(torch.zeros(
                                 (0, cache_shape[0], cache_shape[1]),
-                                dtype=self.store_dtype,
+                                dtype=kv_store_dtype if cache_name in ("k", "v") else torch.bfloat16,
                                 device=self.device,
                             ), FORMAT.PAGED)
-                        
+
                         for (cache_name, cache_shape) in self.cache_meta_info.items()
                 }
-                self.sparse_attention.forward_cache(cache=cache_dummy, loc=loc_dummy, ctx=self.ctx)      
+                self.sparse_attention.forward_cache(cache=cache_dummy, loc=loc_dummy, ctx=self.ctx)
         except Exception:
             raise
-        
+
         self.ctx.summary()
         self.ctx.execute()
 
 
     def _create_buffers(self):
-        
+
         self.cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
                 else nullcontext()
-            ):  
-                self.cache = [
-                    {
-                        cache_name:  torch.zeros(
-                                (self.num_pages, cache_shape[0], cache_shape[1]),
-                                dtype=self.store_dtype,
-                                device=self.device,
-                            )
-                        
-                        for (cache_name, cache_shape) in self.cache_meta_info.items()
-                    }
-                    
-                    for _ in range(self.layer_num)
-                ]
+            ):
+                if self.is_int8:
+                    # Int8 path: k/v as int8, custom caches (centroids etc.) as bf16,
+                    # plus per-token float32 scale buffers for k and v.
+                    # Also maintain a bf16 shadow "k" buffer for forward_cache ops
+                    # (centroid/envelope computation needs bf16 K).
+                    self.cache = []
+                    for _ in range(self.layer_num):
+                        layer_cache = {}
+                        for cache_name, cache_shape in self.cache_meta_info.items():
+                            if cache_name in ("k", "v"):
+                                layer_cache[cache_name] = torch.zeros(
+                                    (self.num_pages, cache_shape[0], cache_shape[1]),
+                                    dtype=torch.int8,
+                                    device=self.device,
+                                )
+                            else:
+                                # Custom caches (centroids, max, min, etc.) stay bf16
+                                layer_cache[cache_name] = torch.zeros(
+                                    (self.num_pages, cache_shape[0], cache_shape[1]),
+                                    dtype=torch.bfloat16,
+                                    device=self.device,
+                                )
+                        # Per-token scale buffers: shape [num_pages, page_size, 1]
+                        # Use float16 to halve memory and bandwidth; precision is
+                        # sufficient for absmax scales (values are small positive floats).
+                        layer_cache["k_scale"] = torch.zeros(
+                            (self.num_pages, self.page_size, 1),
+                            dtype=torch.float16,
+                            device=self.device,
+                        )
+                        layer_cache["v_scale"] = torch.zeros(
+                            (self.num_pages, self.page_size, 1),
+                            dtype=torch.float16,
+                            device=self.device,
+                        )
+                        self.cache.append(layer_cache)
+                    # Pre-allocated prefill workspaces: reused each prefill call
+                    # to avoid dynamic allocation of large bf16 buffers.
+                    # Sized to num_pages (upper bound for any single prefill).
+                    self.prefill_k_workspace = torch.empty(
+                        (self.num_pages, self.page_size, self.head_dim),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    self.prefill_v_workspace = torch.empty(
+                        (self.num_pages, self.page_size, self.head_dim),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                elif self.is_fp8:
+                    # FP8 path: k/v stored as uint8 (bitcast of fp8, 1 byte),
+                    # custom caches (centroids, max, min) as bf16.
+                    # No scale buffers, no shadow buffer, no prefill workspaces —
+                    # FlashInfer handles fp8 natively (we view-cast uint8→fp8 at attention time).
+                    self.cache = []
+                    for _ in range(self.layer_num):
+                        layer_cache = {}
+                        for cache_name, cache_shape in self.cache_meta_info.items():
+                            if cache_name in ("k", "v"):
+                                layer_cache[cache_name] = torch.zeros(
+                                    (self.num_pages, cache_shape[0], cache_shape[1]),
+                                    dtype=torch.uint8,
+                                    device=self.device,
+                                )
+                            else:
+                                layer_cache[cache_name] = torch.zeros(
+                                    (self.num_pages, cache_shape[0], cache_shape[1]),
+                                    dtype=torch.bfloat16,
+                                    device=self.device,
+                                )
+                        self.cache.append(layer_cache)
+                else:
+                    self.cache = [
+                        {
+                            cache_name:  torch.zeros(
+                                    (self.num_pages, cache_shape[0], cache_shape[1]),
+                                    dtype=self.store_dtype,
+                                    device=self.device,
+                                )
+
+                            for (cache_name, cache_shape) in self.cache_meta_info.items()
+                        }
+
+                        for _ in range(self.layer_num)
+                    ]
         
     def _clear_buffers(self):
         del self.cache
@@ -238,26 +334,60 @@ class VTXGraphCachePool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        
+
         assert layer_id_override is None
-        assert k_scale is None
-        assert v_scale is None
-        assert cache_k.dtype == torch.bfloat16
-        assert cache_v.dtype == torch.bfloat16
         assert loc.dtype == torch.int64
-        
+
         layer_id = layer.layer_id
-        
-        vortex_torch.cache.set_kv_buffer_launcher(
-            self.cache[layer_id - self.start_layer]["k"],
-            self.cache[layer_id - self.start_layer]["v"],
-            cache_k.contiguous(),
-            cache_v.contiguous(),
-            loc,
-            self.page_size
-        )
-        
-        self.sparse_attention.forward_cache(self.cache[layer_id - self.start_layer], loc, ctx=self.ctx)
+        layer_cache = self.cache[layer_id - self.start_layer]
+
+        if self.is_int8:
+            cache_k_contig = cache_k.contiguous()
+            cache_v_contig = cache_v.contiguous()
+            # Quantize bf16 K/V to int8 with per-token absmax scales
+            vortex_torch.cache.set_kv_buffer_int8_launcher(
+                layer_cache["k"],
+                layer_cache["v"],
+                layer_cache["k_scale"],
+                layer_cache["v_scale"],
+                cache_k_contig,
+                cache_v_contig,
+                loc,
+                self.page_size
+            )
+            # Pass int8 K directly to forward_cache; reduce kernels dequant
+            # inline using QUANT_TYPE==1 with per-token scales from k_scale.
+            self.ctx.quant_type = 1
+            self.ctx.kv_scale_ptr = layer_cache["k_scale"]
+            self.sparse_attention.forward_cache(layer_cache, loc, ctx=self.ctx)
+        elif self.is_fp8:
+            # FP8 path: quantize bf16→fp8, bitcast to uint8, scatter into paged cache.
+            # Reduce kernels operate directly on uint8 with inline bitcast→fp8→float32 + scale.
+            k_scale_val = k_scale if isinstance(k_scale, (int, float)) else k_scale.item() if k_scale is not None else 1.0
+            v_scale_val = v_scale if isinstance(v_scale, (int, float)) else v_scale.item() if v_scale is not None else 1.0
+            set_kv_buffer_fp8_launcher(
+                layer_cache["k"], layer_cache["v"],
+                cache_k.contiguous(), cache_v.contiguous(),
+                loc, self.page_size, k_scale_val, v_scale_val,
+                fp8_type=self.fp8_type,
+            )
+            # Propagate fp8_type, quant_type, and per-tensor scale so reduce kernels can dequant inline
+            self.ctx.fp8_type = self.fp8_type
+            self.ctx.quant_type = self.fp8_type + 1  # fp8_type=1 (e4m3) → quant_type=2, fp8_type=2 (e5m2) → quant_type=3
+            self.ctx.kv_scale = k_scale_val
+            self.sparse_attention.forward_cache(layer_cache, loc, ctx=self.ctx)
+        else:
+            assert cache_k.dtype == torch.bfloat16
+            assert cache_v.dtype == torch.bfloat16
+            vortex_torch.cache.set_kv_buffer_launcher(
+                layer_cache["k"],
+                layer_cache["v"],
+                cache_k.contiguous(),
+                cache_v.contiguous(),
+                loc,
+                self.page_size
+            )
+            self.sparse_attention.forward_cache(layer_cache, loc, ctx=self.ctx)
         
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         

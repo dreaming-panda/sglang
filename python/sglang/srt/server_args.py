@@ -194,6 +194,14 @@ class ServerArgs:
     vortex_lb_max_chunk_size: int = 32
     vortex_lb_min_chunk_size: int = 8
     vortex_indexer_dtype: str = "bfloat16"
+    vortex_topk_type: str = "naive"
+    vortex_topk_mapping_mode: int = 0
+    vortex_topk_mapping_hparam: float = 0.5
+    vortex_topk_mapping_lut_path: Optional[str] = None
+    vortex_topk_mapping_quantiles_path: Optional[str] = None
+    vortex_topk_hit_rate: bool = False
+    vortex_topk_histogram: bool = False
+    vortex_topk_mapping_noscale: bool = False
     vortex_module_path: str = None
     vortex_module_name: str = None
     
@@ -699,8 +707,8 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "int8"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+. "int8" stores KV in int8 with per-token scales.',
         )
         parser.add_argument(
             "--quantization",
