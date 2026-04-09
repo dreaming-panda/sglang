@@ -4,24 +4,29 @@ sys.path.append("../")
 import python.sglang as sgl
 from transformers import AutoTokenizer
 def main():
-    model_name = "Qwen/Qwen3-1.7B"
+    model_name = "Qwen3-1.7B"
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=True,
-                    page_size=16,
+                    page_size=512,
+                    vortex_block_size=16,
                     vortex_topk_val=30,   
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
                     enable_vortex_sparsity=True,
-                    vortex_page_reserved_bos=1,
-                    vortex_page_reserved_eos=1,
+                    vortex_block_reserved_bos=1,
+                    vortex_block_reserved_eos=1,
                     vortex_layers_skip=list(range(1)),
                     vortex_module_name="block_sparse_attention",
                     vortex_max_seq_lens=8192,
-                    mem_fraction_static=0.7
+                    mem_fraction_static=0.9,
+                    vortex_workload_chunk_size=32
                     )
     
     with open("validation.jsonl", "r", encoding="utf-8") as f:
         ruler_data = [json.loads(line)["input"] for line in f]
+
+    with open("validation.jsonl", "r", encoding="utf-8") as f:
+        ruler_outputs = [json.loads(line)["outputs"][0] for line in f]
     
     texts = [
         [{"role":"user","content": x}] for x in ruler_data
@@ -37,12 +42,15 @@ def main():
     ) for text in texts
     ]
     sampling_params = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 64}
+    accuracy = 0
     with open("ruler_output.jsonl", "w", encoding="utf-8") as f:
             o = llm.generate(prompts, sampling_params)
-            for item in o:
-                    json.dump(item, f, ensure_ascii=False)
+            for res, answer in zip(o, ruler_outputs):
+                    json.dump(res, f, ensure_ascii=False)
                     f.write("\n")
-    
+                    if answer in res["text"]:
+                        accuracy += 1.0
+    print(f"Ruler Accuracy: {accuracy / len(ruler_outputs) * 100:.2f}%")
 
 if __name__ == "__main__":
     main()

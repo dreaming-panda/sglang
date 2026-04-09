@@ -5,16 +5,17 @@ import python.sglang as sgl
 from transformers import AutoTokenizer
 import time
 def main():
-    model_name = "Qwen/Qwen3-1.7B"
+    model_name = "Qwen3-1.7B"
     llm = sgl.Engine(model_path=model_name, 
                     disable_cuda_graph=False,
-                    page_size=16,
+                    page_size=64,
+                    vortex_block_size=16,
                     vortex_topk_val=30,   
                     disable_overlap_schedule=True,
                     attention_backend="flashinfer",
                     enable_vortex_sparsity=True,
-                    vortex_page_reserved_bos=1,
-                    vortex_page_reserved_eos=1,
+                    vortex_block_reserved_bos=1,
+                    vortex_block_reserved_eos=1,
                     vortex_layers_skip=list(range(1)),
                     vortex_module_name="block_sparse_attention",
                     vortex_max_seq_lens=8192,

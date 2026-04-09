@@ -75,12 +75,13 @@ class VTXGraphCachePool(KVCache):
         # for disagg with nvlink
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
-
         self.num_pages = ((self.size + self.page_size) * self.head_num + self.page_size - 1) // self.page_size + 1
         
         self.sparse_attention = sparse_attention
         self.ctx = vortex_torch.cache.Context()
-        
+        self.block_size = model_runner.block_size
+        assert self.page_size % self.block_size == 0, "Page size must be a multiple of block size for block-sparse attention"
+        self.num_blocks_per_page = self.page_size // self.block_size
         self._create_buffers()
         self._initialize_graph(model_runner)
         self.layer_transfer_counter = None
@@ -101,13 +102,12 @@ class VTXGraphCachePool(KVCache):
         
         self.ctx.create(self, model_runner)
         self.ctx.profile()
-        
         try:
             with torch.no_grad():
                 loc_dummy = torch.empty((0,), dtype=torch.int64, device=self.device)
                 cache_dummy = {
                         cache_name:  as_vtensor(torch.zeros(
-                                (0, cache_shape[0], cache_shape[1]),
+                                (0 * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
                                 dtype=self.store_dtype,
                                 device=self.device,
                             ), FORMAT.PAGED)
@@ -124,7 +124,7 @@ class VTXGraphCachePool(KVCache):
 
     def _create_buffers(self):
         
-        self.cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
+        self.cache_meta_info = self.sparse_attention.get_cache_meta_info(self.block_size, self.head_dim)
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -134,7 +134,7 @@ class VTXGraphCachePool(KVCache):
                 self.cache = [
                     {
                         cache_name:  torch.zeros(
-                                (self.num_pages, cache_shape[0], cache_shape[1]),
+                                (self.num_pages * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
                                 dtype=self.store_dtype,
                                 device=self.device,
                             )

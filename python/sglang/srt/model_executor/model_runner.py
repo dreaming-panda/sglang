@@ -193,6 +193,7 @@ class ModelRunner:
             server_args.speculative_algorithm
         )
         self.page_size = server_args.page_size
+        self.block_size = server_args.vortex_block_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = model_config.is_hybrid
@@ -958,12 +959,11 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         elif self.server_args.enable_vortex_sparsity:
-            
             cell_size = (
                     self.model_config.get_num_kv_heads(get_attention_tp_size())
                     * self.model_config.head_dim
                     * num_layers
-                    * self.sparse_attention.get_token_ratio(self.page_size, self.model_config.head_dim)
+                    * self.sparse_attention.get_token_ratio(self.block_size, self.model_config.head_dim)
                     * torch._utils._element_size(self.kv_cache_dtype)
                 )
         else:

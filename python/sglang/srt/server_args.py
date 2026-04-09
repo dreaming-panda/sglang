@@ -185,17 +185,16 @@ class ServerArgs:
     
     # Vortex Sparse Attention
     enable_vortex_sparsity: bool = False
-    vortex_num_selected_pages: int = 30
     vortex_topk_val: int = 30
     vortex_layers_skip: Optional[List[int]] = None
-    vortex_page_reserved_bos: int = 1
-    vortex_page_reserved_eos: int = 1
+    vortex_block_reserved_bos: int = 1
+    vortex_block_reserved_eos: int = 1
     vortex_max_seq_lens: int = -1
-    vortex_lb_max_chunk_size: int = 32
-    vortex_lb_min_chunk_size: int = 8
+    vortex_workload_chunk_size: int = 32
     vortex_indexer_dtype: str = "bfloat16"
     vortex_module_path: str = None
     vortex_module_name: str = None
+    vortex_block_size: int = 16
     
     
     # Optimization/debug options
@@ -1686,24 +1685,24 @@ class ServerArgs:
             action="store_true",
         )
         parser.add_argument(
-            "--vortex-num-selected-pages",
-            type=int,
-            default=ServerArgs.vortex_num_selected_pages,
-        )
-        parser.add_argument(
             "--vortex-topk-val",
             type=int,
             default=ServerArgs.vortex_topk_val,
         )
         parser.add_argument(
-            "--vortex-page-reserved-bos",
+            "--vortex-block-size",
             type=int,
-            default=ServerArgs.vortex_page_reserved_bos,
+            default=ServerArgs.vortex_block_size,
         )
         parser.add_argument(
-            "--vortex-page-reserved-eos",
+            "--vortex-block-reserved-bos",
             type=int,
-            default=ServerArgs.vortex_page_reserved_eos,
+            default=ServerArgs.vortex_block_reserved_bos,
+        )
+        parser.add_argument(
+            "--vortex-block-reserved-eos",
+            type=int,
+            default=ServerArgs.vortex_block_reserved_eos,
         )
         parser.add_argument(
             "--vortex-layers-skip",
@@ -1716,14 +1715,9 @@ class ServerArgs:
             default=ServerArgs.vortex_max_seq_lens,
         )
         parser.add_argument(
-            "--vortex-lb-max-chunk-size",
+            "--vortex-workload-chunk-size",
             type=int,
-            default=ServerArgs.vortex_lb_max_chunk_size,
-        )
-        parser.add_argument(
-            "--vortex-lb-min-chunk-size",
-            type=int,
-            default=ServerArgs.vortex_lb_min_chunk_size,
+            default=ServerArgs.vortex_workload_chunk_size,
         )
         parser.add_argument(
             "--vortex-indexer-dtype",

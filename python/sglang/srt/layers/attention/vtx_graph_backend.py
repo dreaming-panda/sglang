@@ -118,8 +118,10 @@ class VTXGraphAttnBackend(AttentionBackend):
         # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.page_size = model_runner.server_args.page_size
+        self.block_size = model_runner.server_args.vortex_block_size
         self.layers_skip = model_runner.server_args.vortex_layers_skip
-
+        self.num_blocks_per_page = self.page_size // self.block_size
+        assert self.page_size % self.block_size == 0, "Page size must be a multiple of block size."
         # ===========================
         # Prefill KV-indptr buffers
         # ===========================
@@ -175,8 +177,8 @@ class VTXGraphAttnBackend(AttentionBackend):
             ),
             torch.zeros(
                 (
-                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1)
-                    // self.page_size,
+                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.block_size - 1)
+                    // self.block_size,
                 ),
                 dtype=torch.int32,
                 device=model_runner.device
@@ -300,11 +302,11 @@ class VTXGraphAttnBackend(AttentionBackend):
                 # Dummy placeholders: used only for kernel / graph warm-up
                 q_dummy = as_vtensor(torch.empty((1, self.group_size, self.head_dim), device=device, dtype=dtype), FORMAT.BATCHED)
                 o_dummy = as_vtensor(torch.empty((0, 1, 1), device=device, dtype=dtype), FORMAT.RAGGED)
-                cache_meta_info = self.sparse_attention.get_cache_meta_info(self.page_size, self.head_dim)
+                cache_meta_info = self.sparse_attention.get_cache_meta_info(self.block_size, self.head_dim)
                 
                 cache_dummy = {
                         cache_name:  as_vtensor(torch.zeros(
-                                (0, cache_shape[0], cache_shape[1]),
+                                (0 * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
                                 dtype=dtype,
                                 device=device,
                             ), FORMAT.PAGED)
@@ -347,7 +349,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
-                page_size=self.page_size,
+                page_size=self.block_size,
                 q_data_type=self.q_data_type,
                 kv_data_type=self.data_type,
             )
@@ -359,7 +361,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
-                page_size=self.page_size,
+                page_size=self.block_size,
                 q_data_type=self.q_data_type,
                 kv_data_type=self.data_type,
             )
@@ -485,7 +487,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
-                page_size=self.page_size,
+                page_size=self.block_size,
                 q_data_type=self.q_data_type,
                 kv_data_type=self.data_type,
             )
@@ -497,7 +499,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 num_qo_heads=self.group_size,
                 num_kv_heads=1,
                 head_dim=self.head_dim,
-                page_size=self.page_size,
+                page_size=self.block_size,
                 q_data_type=self.q_data_type,
                 kv_data_type=self.data_type,
             )
@@ -535,7 +537,7 @@ class VTXGraphAttnBackend(AttentionBackend):
             num_qo_heads=self.group_size,
             num_kv_heads=1,
             head_dim=self.head_dim,
-            page_size=self.page_size,
+            page_size=self.block_size,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
         )
@@ -547,7 +549,7 @@ class VTXGraphAttnBackend(AttentionBackend):
             num_qo_heads=self.group_size,
             num_kv_heads=1,
             head_dim=self.head_dim,
-            page_size=self.page_size,
+            page_size=self.block_size,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
         )
@@ -662,8 +664,8 @@ class VTXGraphAttnBackend(AttentionBackend):
         # Read Cache from memory pool
         cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
         
-        cache_k = cache["k"].view(-1, self.page_size, 1, self.head_dim)
-        cache_v = cache["v"].view(-1, self.page_size, 1, self.head_dim)
+        cache_k = cache["k"].view(-1, self.block_size, 1, self.head_dim)
+        cache_v = cache["v"].view(-1, self.block_size, 1, self.head_dim)
         
         # Decide whether to use sparsity on this layer
         use_sparsity = (layer.layer_id not in self.layers_skip)
