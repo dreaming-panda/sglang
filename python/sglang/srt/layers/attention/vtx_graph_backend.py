@@ -300,30 +300,40 @@ class VTXGraphAttnBackend(AttentionBackend):
         try:
             with torch.no_grad():
                 # Dummy placeholders: used only for kernel / graph warm-up
-                q_dummy = as_vtensor(torch.empty((1, self.group_size, self.head_dim), device=device, dtype=dtype), FORMAT.BATCHED)
-                o_dummy = as_vtensor(torch.empty((0, 1, 1), device=device, dtype=dtype), FORMAT.RAGGED)
+                q_dummy = as_vtensor(torch.empty((0, self.group_size, self.head_dim), device=device, dtype=dtype), FORMAT.BATCHED, tensor_id=0)
+                self.ctx.tensor_list.append(q_dummy)
+                self.ctx.output_tensor_to_op_list.append(None)  # Placeholder for mapping output tensors to ops
+                self.ctx.tensor_id_to_tensor_name_map[q_dummy.tensor_id] = "q"
+                o_dummy = as_vtensor(torch.empty((0, 1, 1), device=device, dtype=dtype), FORMAT.RAGGED, tensor_id=1)
+                self.ctx.tensor_list.append(o_dummy)
+                self.ctx.output_tensor_to_op_list.append(None)  # Placeholder for mapping output tensors to ops
+                self.ctx.tensor_id_to_tensor_name_map[o_dummy.tensor_id] = "o"
                 cache_meta_info = self.sparse_attention.get_cache_meta_info(self.block_size, self.head_dim)
-                
-                cache_dummy = {
-                        cache_name:  as_vtensor(torch.zeros(
-                                (0 * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
-                                dtype=dtype,
-                                device=device,
-                            ), FORMAT.PAGED)
-                        
-                        for (cache_name, cache_shape) in cache_meta_info.items()
-                    }
-                
+                cache_dummy = {}
+                for i, (cache_name, cache_shape) in enumerate(cache_meta_info.items()):
+                    cache_dummy[cache_name] = as_vtensor(
+                        torch.zeros(
+                            (0 * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
+                            dtype=dtype,
+                            device=device,
+                        ),
+                        FORMAT.PAGED,
+                        tensor_id=2 + i
+                    )
+                    self.ctx.tensor_list.append(cache_dummy[cache_name])
+                    self.ctx.output_tensor_to_op_list.append(None)  # Placeholder for mapping output tensors to ops
+                    self.ctx.tensor_id_to_tensor_name_map[cache_dummy[cache_name].tensor_id] = f"cache['{cache_name}']"
                 indexer(q_dummy, o_dummy, cache_dummy, ctx=self.ctx)
 
 
         except Exception:
             raise
-
         
+        
+        compiled_indexer_cls = vortex_torch.indexer.compiler.compile.compile(self.ctx)
+        self.compiled_indexer = compiled_indexer_cls()
         self.ctx.summary()
         self.ctx.execute()
-
 
 
     
@@ -366,7 +376,26 @@ class VTXGraphAttnBackend(AttentionBackend):
                 kv_data_type=self.data_type,
             )
             self.forward_metadata = DecodeMetadata([self.decode_wrappers[0], self.decode_wrappers[1]])
-        
+
+            # k = self.page_size // self.block_size
+            # for wi in range(self.ctx.winfo_num_workloads.item()):
+            #     kv_offset_i = self.ctx.winfo_kv_offsets[wi].item()
+            #     kv_len_i = self.ctx.winfo_kv_lens[wi].item()
+            #     indices_i = self.ctx.dense_kv_indices[kv_offset_i:kv_offset_i + kv_len_i]
+
+            #     # 每 k 个一组检查是否连续递增
+            #     for start in range(0, len(indices_i), k):
+            #         group = indices_i[start:start + k]
+
+            #         # 长度为 0 或 1 时天然满足连续
+            #         if len(group) <= 1:
+            #             continue
+
+            #         assert torch.all(group[1:] == group[:-1] + 1), (
+            #             f"indices_i is not consecutive within group: "
+            #             f"wi={wi}, group_start={start}, group={group.tolist()}"
+            #         )
+            # print("Decode plan validation passed: all indices are consecutive within their respective groups.")
         elif forward_batch.forward_mode.is_extend():
             
             prefix_lens = forward_batch.extend_prefix_lens
@@ -675,7 +704,13 @@ class VTXGraphAttnBackend(AttentionBackend):
             q = q.view(-1, self.group_size, layer.head_dim).contiguous()
 
             # Build sparse indices into paged KV buffers
-            self.sparse_attention.forward_indexer(
+            # self.sparse_attention.forward_indexer(
+            #     q=q,
+            #     o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
+            #     cache=cache,
+            #     ctx=self.ctx
+            # )
+            self.compiled_indexer.forward(
                 q=q,
                 o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
                 cache=cache,

@@ -195,6 +195,7 @@ class ServerArgs:
     vortex_module_path: str = None
     vortex_module_name: str = None
     vortex_block_size: int = 16
+    vortex_compilation_cache_dir: str = None
     
     
     # Optimization/debug options
@@ -1734,6 +1735,11 @@ class ServerArgs:
             "--vortex-module-name",
             type=str,
             default=ServerArgs.vortex_module_name,
+        )
+        parser.add_argument(
+            "--vortex-compilation-cache-dir",
+            type=str,
+            default=ServerArgs.vortex_compilation_cache_dir,
         )
         
         
