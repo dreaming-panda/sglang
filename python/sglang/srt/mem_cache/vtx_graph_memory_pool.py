@@ -87,7 +87,7 @@ class VTXGraphCachePool(KVCache):
         self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
-
+        self.layers_skip = model_runner.server_args.vortex_layers_skip
         cache_size = self.get_cache_size_bytes()
         
         logger.info(
@@ -256,7 +256,8 @@ class VTXGraphCachePool(KVCache):
             loc,
             self.page_size
         )
-        
+        if layer_id in self.layers_skip:
+            return
         self.sparse_attention.forward_cache(self.cache[layer_id - self.start_layer], loc, ctx=self.ctx)
         
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

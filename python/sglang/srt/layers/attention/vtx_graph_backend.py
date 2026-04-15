@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
+from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -68,7 +69,6 @@ class VTXGraphAttnBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        self.decode_use_tensor_cores = True
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -111,7 +111,7 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.count = 0
+        self.decode_use_tensor_cores = should_use_tensor_core(self.data_type, self.num_qo_heads, self.num_kv_heads)
         assert self.q_data_type == torch.bfloat16
         assert self.data_type == torch.bfloat16
         
@@ -377,25 +377,6 @@ class VTXGraphAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata([self.decode_wrappers[0], self.decode_wrappers[1]])
 
-            # k = self.page_size // self.block_size
-            # for wi in range(self.ctx.winfo_num_workloads.item()):
-            #     kv_offset_i = self.ctx.winfo_kv_offsets[wi].item()
-            #     kv_len_i = self.ctx.winfo_kv_lens[wi].item()
-            #     indices_i = self.ctx.dense_kv_indices[kv_offset_i:kv_offset_i + kv_len_i]
-
-            #     # 每 k 个一组检查是否连续递增
-            #     for start in range(0, len(indices_i), k):
-            #         group = indices_i[start:start + k]
-
-            #         # 长度为 0 或 1 时天然满足连续
-            #         if len(group) <= 1:
-            #             continue
-
-            #         assert torch.all(group[1:] == group[:-1] + 1), (
-            #             f"indices_i is not consecutive within group: "
-            #             f"wi={wi}, group_start={start}, group={group.tolist()}"
-            #         )
-            # print("Decode plan validation passed: all indices are consecutive within their respective groups.")
         elif forward_batch.forward_mode.is_extend():
             
             prefix_lens = forward_batch.extend_prefix_lens
@@ -704,12 +685,6 @@ class VTXGraphAttnBackend(AttentionBackend):
             q = q.view(-1, self.group_size, layer.head_dim).contiguous()
 
             # Build sparse indices into paged KV buffers
-            # self.sparse_attention.forward_indexer(
-            #     q=q,
-            #     o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
-            #     cache=cache,
-            #     ctx=self.ctx
-            # )
             self.compiled_indexer.forward(
                 q=q,
                 o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
