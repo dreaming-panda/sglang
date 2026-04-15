@@ -169,8 +169,8 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.kv_indices_decode = [
             torch.zeros(
                 (
-                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.page_size - 1)
-                    // self.page_size,
+                    (max_bs * self.num_kv_heads * model_runner.model_config.context_len + self.block_size - 1)
+                    // self.block_size,
                 ),
                 dtype=torch.int32,
                 device=model_runner.device
