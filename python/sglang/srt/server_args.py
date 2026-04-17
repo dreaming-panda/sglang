@@ -195,6 +195,7 @@ class ServerArgs:
     vortex_module_path: str = None
     vortex_module_name: str = None
     vortex_block_size: int = 16
+    vortex_topk_ratio: float = 0.0
     vortex_compilation_cache_dir: str = None
     
     
@@ -1741,8 +1742,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.vortex_compilation_cache_dir,
         )
-        
-        
+        parser.add_argument(
+            "--vortex-topk-ratio",
+            type=float,
+            default=ServerArgs.vortex_topk_ratio,
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
