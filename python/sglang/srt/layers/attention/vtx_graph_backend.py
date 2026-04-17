@@ -15,6 +15,7 @@ from functools import partial
 import torch
 import vortex_torch
 from vortex_torch.abs import as_vtensor, FORMAT
+from vortex_torch import is_hopper
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
@@ -229,17 +230,14 @@ class VTXGraphAttnBackend(AttentionBackend):
         )
 
         
-        fmha_backend = "auto"
-        if is_sm100_supported():
-            fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
+            self.workspace_buffer, "NHD", backend= "auto" if not is_hopper() else "fa3"
         )
 
         self.prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
+                        backend="fa2" if not is_hopper() else "fa3",
                     )
         
         self.decode_wrappers = [
