@@ -108,11 +108,11 @@ class VTXGraphCachePool(KVCache):
                 cache_dummy = {
                         cache_name:  as_vtensor(torch.zeros(
                                 (0 * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
-                                dtype=self.store_dtype,
+                                dtype=cache_dtype,
                                 device=self.device,
                             ), FORMAT.PAGED)
                         
-                        for (cache_name, cache_shape) in self.cache_meta_info.items()
+                        for (cache_name, (cache_shape, cache_dtype)) in self.cache_meta_info.items()
                 }
                 self.sparse_attention.forward_cache(cache=cache_dummy, loc=loc_dummy, ctx=self.ctx)      
         except Exception:
@@ -124,7 +124,7 @@ class VTXGraphCachePool(KVCache):
 
     def _create_buffers(self):
         
-        self.cache_meta_info = self.sparse_attention.get_cache_meta_info(self.block_size, self.head_dim)
+        self.cache_meta_info = self.sparse_attention.get_cache_meta_info()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -135,11 +135,11 @@ class VTXGraphCachePool(KVCache):
                     {
                         cache_name:  torch.zeros(
                                 (self.num_pages * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
-                                dtype=self.store_dtype,
+                                dtype=cache_dtype,
                                 device=self.device,
                             )
                         
-                        for (cache_name, cache_shape) in self.cache_meta_info.items()
+                        for (cache_name, (cache_shape, cache_dtype)) in self.cache_meta_info.items()
                     }
                     
                     for _ in range(self.layer_num)

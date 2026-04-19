@@ -306,13 +306,13 @@ class VTXGraphAttnBackend(AttentionBackend):
                 self.ctx.tensor_list.append(o_dummy)
                 self.ctx.output_tensor_to_op_list.append(None)  # Placeholder for mapping output tensors to ops
                 self.ctx.tensor_id_to_tensor_name_map[o_dummy.tensor_id] = "o"
-                cache_meta_info = self.sparse_attention.get_cache_meta_info(self.block_size, self.head_dim)
+                cache_meta_info = self.sparse_attention.get_cache_meta_info()
                 cache_dummy = {}
-                for i, (cache_name, cache_shape) in enumerate(cache_meta_info.items()):
+                for i, (cache_name, (cache_shape, cache_dtype)) in enumerate(cache_meta_info.items()):
                     cache_dummy[cache_name] = as_vtensor(
                         torch.zeros(
                             (0 * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
-                            dtype=dtype,
+                            dtype=cache_dtype,
                             device=device,
                         ),
                         FORMAT.PAGED,

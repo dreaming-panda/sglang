@@ -89,7 +89,6 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 
-from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
@@ -244,13 +243,6 @@ class ModelRunner:
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
 
-        self.sparse_attention = None
-        if self.server_args.enable_vortex_sparsity:
-            import vortex_torch
-            self.sparse_attention = vortex_torch.flow.build_vflow(
-                self.server_args.vortex_module_name,
-                user_file=self.server_args.vortex_module_path
-            )
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -311,7 +303,37 @@ class ModelRunner:
         # load LoRA adapters dynamically later.
         if server_args.lora_paths is not None:
             self.init_lora_manager()
+        
+        if self.server_args.kv_cache_dtype == "auto":
+            self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+            if _is_hip:  # Using natively supported format
+                self.kv_cache_dtype = torch.float8_e5m2fnuz
+            else:
+                self.kv_cache_dtype = torch.float8_e5m2
+        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+            if _is_hip:  # Using natively supported format
+                self.kv_cache_dtype = torch.float8_e4m3fnuz
+            else:
+                self.kv_cache_dtype = torch.float8_e4m3fn
+        else:
+            raise ValueError(
+                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
+            )
 
+        self.sparse_attention = None
+        if self.server_args.enable_vortex_sparsity:
+            import vortex_torch
+            self.sparse_attention = vortex_torch.flow.build_vflow(
+                self.server_args.vortex_module_name,
+                user_file=self.server_args.vortex_module_path
+            )
+            self.sparse_attention.initialize(
+                block_size=self.block_size,
+                head_dim=self.model_config.head_dim,
+                kv_cache_dtype=self.kv_cache_dtype,
+                q_data_type=self.dtype
+            )
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -963,7 +985,7 @@ class ModelRunner:
                     self.model_config.get_num_kv_heads(get_attention_tp_size())
                     * self.model_config.head_dim
                     * num_layers
-                    * self.sparse_attention.get_token_ratio(self.block_size, self.model_config.head_dim)
+                    * self.sparse_attention.get_token_ratio()
                     * torch._utils._element_size(self.kv_cache_dtype)
                 )
         else:
@@ -1020,23 +1042,7 @@ class ModelRunner:
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
-        if self.server_args.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = torch.float8_e5m2fnuz
-            else:
-                self.kv_cache_dtype = torch.float8_e5m2
-        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = torch.float8_e4m3fnuz
-            else:
-                self.kv_cache_dtype = torch.float8_e4m3fn
-        else:
-            raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
-            )
-
+        
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if max_num_reqs is None:
@@ -1200,6 +1206,8 @@ class ModelRunner:
                     device=self.device,
                 )
             elif self.server_args.enable_vortex_sparsity:
+                    
+                    from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
                     
                     self.token_to_kv_pool = VTXGraphCachePool(
                         self.max_total_num_tokens,

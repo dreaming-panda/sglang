@@ -34,9 +34,6 @@ runtime_common = [
     "packaging==25.0",
     "partial_json_parser",
     "pillow",
-    #"rpds_py==0.30.0",
-    #"referencing==0.37.0",
-    #"regex==2026.1.15",
     "prometheus-client>=0.20.0",
     "psutil",
     "pydantic",
@@ -55,7 +52,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.2.4",
+    "sgl-kernel==0.3.5",
     "cuda-python==13.1.1",
     "einops==0.8.1"
 ]
