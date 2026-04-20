@@ -114,7 +114,8 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.q_data_type = model_runner.dtype
         self.decode_use_tensor_cores = should_use_tensor_core(self.data_type, self.num_qo_heads, self.num_kv_heads)
         assert self.q_data_type == torch.bfloat16
-        assert self.data_type == torch.bfloat16
+        assert self.data_type in [torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn]
+        self.is_fp8 = (self.data_type in [torch.float8_e5m2, torch.float8_e4m3fn])
         
         # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -237,7 +238,7 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.prefill_wrapper_paged = BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2" if not is_hopper() else "fa3",
+                        backend="fa2" if ((not is_hopper()) or self.is_fp8) else "fa3",
                     )
         
         self.decode_wrappers = [
@@ -252,6 +253,8 @@ class VTXGraphAttnBackend(AttentionBackend):
                     use_tensor_cores=self.decode_use_tensor_cores,
                 ),
         ]
+        
+        self.plan_decode = vortex_torch.indexer.utils_sglang.get_decode_planner(model_runner.server_args.vortex_schedule_policy)
         
         self.sparse_attention = model_runner.sparse_attention
         self.ctx = vortex_torch.indexer.Context()
@@ -343,7 +346,7 @@ class VTXGraphAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             
             bs = len(forward_batch.req_pool_indices)
-            vortex_torch.indexer.utils_sglang.plan_decode(
+            self.plan_decode(
                 cached_seq_lens=forward_batch.seq_lens.to(torch.int32),
                 req_to_token=self.req_to_token,
                 req_indices=forward_batch.req_pool_indices,
@@ -481,7 +484,7 @@ class VTXGraphAttnBackend(AttentionBackend):
                 
             ]
 
-            vortex_torch.indexer.utils_sglang.plan_decode(
+            self.plan_decode(
                 cached_seq_lens=seq_lens.to(torch.int32),
                 req_to_token=self.req_to_token,
                 req_indices=req_pool_indices,
@@ -531,7 +534,7 @@ class VTXGraphAttnBackend(AttentionBackend):
     ):
         assert forward_mode.is_decode_or_idle()
         
-        vortex_torch.indexer.utils_sglang.plan_decode(
+        self.plan_decode(
                 cached_seq_lens=seq_lens.to(torch.int32),
                 req_to_token=self.req_to_token,
                 req_indices=req_pool_indices,

@@ -197,6 +197,7 @@ class ServerArgs:
     vortex_block_size: int = 16
     vortex_topk_ratio: float = 0.0
     vortex_compilation_cache_dir: str = None
+    vortex_schedule_policy: str = None
     
     
     # Optimization/debug options
@@ -1741,6 +1742,11 @@ class ServerArgs:
             "--vortex-compilation-cache-dir",
             type=str,
             default=ServerArgs.vortex_compilation_cache_dir,
+        )
+        parser.add_argument(
+            "--vortex-schedule-policy",
+            type=str,
+            default=ServerArgs.vortex_schedule_policy,
         )
         parser.add_argument(
             "--vortex-topk-ratio",

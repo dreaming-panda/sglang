@@ -95,9 +95,17 @@ class VTXGraphCachePool(KVCache):
         )
         
         self.mem_usage = cache_size / GB
-        assert self.dtype == torch.bfloat16
-        assert self.store_dtype == torch.bfloat16
-    
+        assert self.dtype in [torch.bfloat16, torch.float8_e5m2, torch.float8_e4m3fn], f"Unsupported dtype {self.dtype} for KV cache"
+        assert self.store_dtype in [torch.bfloat16, torch.uint8], f"Unsupported store dtype {self.store_dtype} for KV cache"
+        if self.dtype == torch.bfloat16:
+            self.set_kv_buffer_func = vortex_torch.cache.set_kv_buffer_launcher
+        elif self.dtype == torch.float8_e4m3fn:
+            self.set_kv_buffer_func = vortex_torch.cache.set_kv_buffer_fp8_e4m3_launcher
+        elif self.dtype == torch.float8_e5m2:
+            self.set_kv_buffer_func = vortex_torch.cache.set_kv_buffer_fp8_e5m2_launcher
+        else:
+            raise ValueError(f"Unsupported dtype {self.dtype} for KV cache")
+        
     def _initialize_graph(self, model_runner) -> None:
         
         self.ctx.create(self, model_runner)
@@ -242,13 +250,11 @@ class VTXGraphCachePool(KVCache):
         assert layer_id_override is None
         assert k_scale is None
         assert v_scale is None
-        assert cache_k.dtype == torch.bfloat16
-        assert cache_v.dtype == torch.bfloat16
         assert loc.dtype == torch.int64
         
         layer_id = layer.layer_id
         
-        vortex_torch.cache.set_kv_buffer_launcher(
+        self.set_kv_buffer_func(
             self.cache[layer_id - self.start_layer]["k"],
             self.cache[layer_id - self.start_layer]["v"],
             cache_k.contiguous(),
