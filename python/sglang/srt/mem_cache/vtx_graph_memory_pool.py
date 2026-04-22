@@ -112,22 +112,36 @@ class VTXGraphCachePool(KVCache):
         self.ctx.profile()
         try:
             with torch.no_grad():
+                cache_dummy = {}
                 loc_dummy = torch.empty((0,), dtype=torch.int64, device=self.device)
-                cache_dummy = {
-                        cache_name:  as_vtensor(torch.zeros(
+                for i, (cache_name, (cache_shape, cache_dtype)) in enumerate(self.cache_meta_info.items()):
+                        cache_dummy[cache_name] = as_vtensor(torch.zeros(
                                 (0 * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
                                 dtype=cache_dtype,
                                 device=self.device,
-                            ), FORMAT.PAGED)
+                            ), FORMAT.PAGED, tensor_id=i)
                         
-                        for (cache_name, (cache_shape, cache_dtype)) in self.cache_meta_info.items()
-                }
+                        self.ctx.tensor_list.append(cache_dummy[cache_name])
+                        self.ctx.output_tensor_to_op_list.append(None)  # Placeholder for mapping output tensors to ops
+                        self.ctx.tensor_id_to_tensor_name_map[cache_dummy[cache_name].tensor_id] = f"cache['{cache_name}']"
+                # cache_dummy = {
+                #         cache_name:  as_vtensor(torch.zeros(
+                #                 (0 * self.num_blocks_per_page, cache_shape[0], cache_shape[1]),
+                #                 dtype=cache_dtype,
+                #                 device=self.device,
+                #             ), FORMAT.PAGED)
+                        
+                #         for (cache_name, (cache_shape, cache_dtype)) in self.cache_meta_info.items()
+                # }
                 self.sparse_attention.forward_cache(cache=cache_dummy, loc=loc_dummy, ctx=self.ctx)      
         except Exception:
             raise
         
+        compiled_cache_cls = vortex_torch.cache.compiler.compile.compile(self.ctx)
+        self.compiled_cache = compiled_cache_cls()
         self.ctx.summary()
         self.ctx.execute()
+
 
 
     def _create_buffers(self):
@@ -264,7 +278,7 @@ class VTXGraphCachePool(KVCache):
         )
         if layer_id in self.layers_skip:
             return
-        self.sparse_attention.forward_cache(self.cache[layer_id - self.start_layer], loc, ctx=self.ctx)
+        self.compiled_cache.forward(self.cache[layer_id - self.start_layer], loc, ctx=self.ctx)
         
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         
