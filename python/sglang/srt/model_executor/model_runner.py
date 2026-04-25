@@ -332,7 +332,8 @@ class ModelRunner:
                 block_size=self.block_size,
                 head_dim=self.model_config.head_dim,
                 kv_cache_dtype=self.kv_cache_dtype,
-                q_data_type=self.dtype
+                q_data_type=self.dtype,
+                intermediate_dtype=self.server_args.vortex_dtype,
             )
         # Init memory pool and attention backends
         self.init_memory_pool(

@@ -191,7 +191,7 @@ class ServerArgs:
     vortex_block_reserved_eos: int = 1
     vortex_max_seq_lens: int = -1
     vortex_workload_chunk_size: int = 32
-    vortex_indexer_dtype: str = "bfloat16"
+    vortex_dtype: str = "bfloat16"
     vortex_module_path: str = None
     vortex_module_name: str = None
     vortex_block_size: int = 16
@@ -1723,10 +1723,10 @@ class ServerArgs:
             default=ServerArgs.vortex_workload_chunk_size,
         )
         parser.add_argument(
-            "--vortex-indexer-dtype",
+            "--vortex-dtype",
             type=str,
-            choices=["float32"],
-            default=ServerArgs.vortex_indexer_dtype,
+            choices=["bfloat16", "float16", "float32", "fp8_e5m2", "fp8_e4m3fn"],
+            default=ServerArgs.vortex_dtype,
         )
         parser.add_argument(
             "--vortex-module-path",

@@ -336,7 +336,6 @@ class VTXGraphAttnBackend(AttentionBackend):
         self.ctx.summary()
         self.ctx.execute()
 
-
     
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         
