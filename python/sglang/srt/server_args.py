@@ -186,6 +186,7 @@ class ServerArgs:
     # Vortex Sparse Attention
     enable_vortex_sparsity: bool = False
     vortex_topk_val: int = 30
+    vortex_max_topk_val: int = None
     vortex_layers_skip: Optional[List[int]] = None
     vortex_block_reserved_bos: int = 1
     vortex_block_reserved_eos: int = 1
@@ -1691,6 +1692,11 @@ class ServerArgs:
             "--vortex-topk-val",
             type=int,
             default=ServerArgs.vortex_topk_val,
+        )
+        parser.add_argument(
+            "--vortex-max-topk-val",
+            type=int,
+            default=ServerArgs.vortex_max_topk_val,
         )
         parser.add_argument(
             "--vortex-block-size",
