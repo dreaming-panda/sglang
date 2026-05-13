@@ -1208,9 +1208,8 @@ class ModelRunner:
                 )
             elif self.server_args.enable_vortex_sparsity:
                     
-                    from sglang.srt.mem_cache.vtx_graph_memory_pool import VTXGraphCachePool
-                    
-                    self.token_to_kv_pool = VTXGraphCachePool(
+                    from vortex_torch.engine.sgl.memory_pool import VortexCachePool
+                    self.token_to_kv_pool = VortexCachePool(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
@@ -1306,11 +1305,8 @@ class ModelRunner:
         if self.server_args.attention_backend == "flashinfer":
             if self.server_args.enable_vortex_sparsity:
                 
-                from sglang.srt.layers.attention.vtx_graph_backend import (
-                        VTXGraphAttnBackend,
-                )
-                    
-                return VTXGraphAttnBackend(self)
+                from vortex_torch.engine.sgl.attention_backend import VortexFlashInferBackend
+                return VortexFlashInferBackend(self)
                 
                 
             elif not self.use_mla_backend:

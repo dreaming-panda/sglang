@@ -578,7 +578,7 @@ class VTXGraphAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         
-        assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
+        #assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
         
@@ -659,7 +659,7 @@ class VTXGraphAttnBackend(AttentionBackend):
         """
 
         # Sanity checks and setup
-        assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
+        #assert isinstance(forward_batch.token_to_kv_pool, VTXGraphCachePool)
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
 
