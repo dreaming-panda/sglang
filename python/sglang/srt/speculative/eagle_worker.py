@@ -178,7 +178,22 @@ class EAGLEWorker(TpModelWorker):
         self.draft_extend_attn_backend = None
 
         if self.server_args.attention_backend == "flashinfer":
-            if not global_server_args_dict["use_mla_backend"]:
+            if self.server_args.enable_vortex_sparsity:
+                # VTX sparse path: draft model uses VTXGraphCachePool, so needs
+                # VTX-compatible backends. Draft decode uses dense attention (no sparsity).
+                from sglang.srt.layers.attention.vtx_graph_backend import (
+                    VTXGraphAttnBackend,
+                    VTXGraphMultiStepDraftBackend,
+                )
+                self.draft_attn_backend = VTXGraphMultiStepDraftBackend(
+                    self.draft_model_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
+                self.draft_extend_attn_backend = VTXGraphAttnBackend(
+                    self.draft_model_runner,
+                )
+            elif not global_server_args_dict["use_mla_backend"]:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
                     FlashInferMultiStepDraftBackend,
@@ -619,6 +634,10 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
+
+            # For VTX multi-step backend, re-plan decode for step i with updated seq_lens
+            if hasattr(self.draft_attn_backend, "_replan_for_step") and i > 0:
+                self.draft_attn_backend._replan_for_step(i)
 
             # Run forward
             logits_output = self.draft_model_runner.model.forward(
